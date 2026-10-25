@@ -1,0 +1,4481 @@
+"""
+MT-SUPINN — Physics-Regularized Multi-Task Network
+for Bearing RUL Prediction with Deep-Ensemble Conformal UQ
+
+Known limitations (documented, not fixed — see paper Section "Limitations"):
+  * Channel semantics are dataset-dependent. The model expects
+    [vib, cur_1, cur_2, temp]. CWRU/Pronostia only provide vibration
+    channels and are zero-padded into the current/temperature slots.
+    The "current" branch therefore processes accelerometer data for
+    those datasets. Do NOT interpret per-branch results as modality
+    attribution.
+  *  * The RUL target is a power law y(τ) = 1 − τ^α with per-bearing α
+    fitted from the late-life RMS slope. Because the target is EXACTLY
+    Paris-shaped (dD/dτ = C · D^m with C = α, m = (α−1)/α analytically),
+    (C, m) are set in closed form and no LSQ is performed. The prior
+    is therefore not fit to the target — it is derived from it.
+    Remaining limitation: m < 1 for any α-scaled target; per-bearing m
+    lies in [0.231, 0.667].
+  * RUL is predicted from single 1024-sample windows (0.04 s at 25.6 kHz).
+    No temporal context across the run. Comparisons with trajectory-level
+    models (e.g. BiLSTM over the whole degradation sequence) are not
+    like-for-like.
+  * MC-dropout passes run with training=True, which places BatchNorm
+    in batch-statistics mode. Reported as a limitation.
+  * Sample size (3 train / 1 val / 2 test bearings) is small; leave-one-
+    bearing-out CV is the recommended evaluation but is not implemented
+    here.
+"""
+
+# =============================================================
+# §1  IMPORTS AND CONFIGURATION
+# =============================================================
+
+import os
+import re
+import glob
+import json
+import time
+import random
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any, Callable
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import scipy.io as sio
+import scipy.stats as stats
+from scipy.stats import skew, kurtosis, pearsonr, spearmanr
+from scipy.optimize import minimize
+from scipy.linalg import cholesky
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import (confusion_matrix, mean_squared_error,
+                             mean_absolute_error, classification_report,
+                             silhouette_score, f1_score)
+from sklearn.model_selection import (train_test_split, StratifiedShuffleSplit,
+                                     KFold)
+from sklearn.cluster import KMeans
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import (RBF, Matern, WhiteKernel,
+                                              ConstantKernel as C_kernel)
+
+import joblib
+import matplotlib.pyplot as plt
+
+# [FIX-8] Determinism env vars must be set BEFORE tensorflow import.
+os.environ.setdefault('TF_DETERMINISTIC_OPS', '1')
+os.environ.setdefault('TF_CUDNN_DETERMINISTIC', '1')
+os.environ.setdefault('PYTHONHASHSEED', '0')
+
+import tensorflow as tf
+from tensorflow.keras import layers, Model, regularizers
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+import warnings
+warnings.filterwarnings('ignore')
+
+CURRENT_SEED = 42   # change per seed run: 42, 123, 256, 7, 99, 512
+
+
+@dataclass
+class ConfigV3:
+    # ---- paths ----
+    cwru_path: str = "/kaggle/input/datasets/pleiades74/my-cwru/csv_files"
+    paderborn_path: str = "/kaggle/input/datasets/pleiades74/multimodel-pader/Paderborn"
+    pronostia_path: str = "/kaggle/input/datasets/egorefimow/smallone/Pronostia dataset"
+    output_dir: str = "/kaggle/working/mt_supinn_v3"
+
+    # ---- windowing ----
+    window_size: int = 1024
+    stride: int = 1024
+    batch_size: int = 128
+    epochs: int = 80
+    learning_rate: float = 0.001
+
+    # ---- architecture ----
+    cnn_filters: int = 32
+    lstm_units: int = 64
+    dropout: float = 0.25
+    l2_reg: float = 5e-4
+    temperature_scaling: float = 1.5
+
+    # ---- task heads ----
+    cwru_classes: int = 4
+    paderborn_classes: int = 3
+    n_clusters: int = 5
+
+    # ---- task loss weights ----
+    weight_cwru: float = 1.0
+    weight_paderborn: float = 1.5
+    weight_pronostia_rul: float = 60.0
+
+    # ---- fixed-λ physics weights (used when use_physics_curriculum=False) ----
+    # [FIX-4] These must be nonzero so that "fixed physics" arms actually
+    #         exercise Paris/mono/consistency. Match lambda_max_* magnitudes.
+    alpha_mono: float = 0.05
+    beta_paris: float = 0.02
+    gamma_consist: float = 0.05
+    cluster_loss_weight: float = 0.001
+
+    # ---- adaptive physics ----
+    use_adaptive_physics: bool = True
+    use_huber_residual: bool = False
+    huber_delta: float = 0.05
+    use_physics_curriculum: bool = True
+    curriculum_k: float = 0.3
+    curriculum_c0: float = 10.
+    lambda_max_mono: float = 0.05
+    lambda_max_paris: float = 0.02
+    lambda_max_consist: float = 0.05
+    use_uncertainty_weighting: bool = True
+    sigma_eps: float = 1e-6
+
+    # ---- GPR ----
+    gpr_kernel: str = 'matern'
+    gpr_length_scale: float = 5.0
+    gpr_noise: float = 1e-3
+    gpr_n_restarts: int = 1
+    gpr_normalize_y: bool = True
+
+    # ---- bounded LSQ (Paris on damage: dD/dtau = C * D^m) ----
+    paris_C_bounds: Tuple[float, float] = (1e-12, 1e2)
+    paris_m_bounds: Tuple[float, float] = (0.2, 6.0)
+    lsq_use_loglog_fallback: bool = True
+    lsq_condition_threshold: float = 1e6
+
+    # ---- RUL target ----
+    rul_plateau_frac: float = 0.0        # deprecated
+    rul_decay_k: float = 5.0
+    rul_alpha: float = 2.0
+    rul_target_mode: str = 'power'       # 'power' | 'kinked' | 'expo'
+
+    use_data_augmentation: bool = True
+
+    # ---- UQ ----
+    uq_method: str = 'conformal'
+    ensemble_size: int = 5
+    ensemble_epochs: int = 60
+    conformal_alpha: float = 0.05
+    mc_dropout_passes: int = 100
+
+    # ---- misc ----
+    random_state: int = 42
+    skip_ews: bool = False
+    use_dann: bool = True
+    lightweight_mode: bool = False
+
+    experiment_name: str = "MT_SUPINN_physics_regularized"
+
+    def __post_init__(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+
+
+# =============================================================
+# §1b  REPRODUCIBILITY
+# =============================================================
+
+def set_reproducible_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except Exception:
+        pass
+
+
+# =============================================================
+# §2  DATA LOADERS
+# =============================================================
+
+class FeatureExtractor:
+    @staticmethod
+    def ews_features(signal: np.ndarray) -> np.ndarray:
+        if len(signal) == 0:
+            return np.zeros(11, dtype=np.float32)
+
+        eps = 1e-10
+        rms = np.sqrt(np.mean(signal ** 2) + eps)
+        peak = np.max(np.abs(signal))
+        crest = peak / (rms + eps)
+        std_val = np.std(signal)
+
+        if np.std(signal) < eps:
+            skew_val, kurt_val = 0.0, -3.0
+        else:
+            skew_val = skew(signal, bias=False, nan_policy='omit')
+            kurt_val = kurtosis(signal, fisher=True, bias=False, nan_policy='omit')
+
+        peak_to_peak = np.ptp(signal)
+        mean_abs = np.mean(np.abs(signal)) + eps
+        shape_factor = rms / mean_abs
+        impulse_factor = peak / mean_abs
+        mean_sqrt_abs = np.mean(np.sqrt(np.abs(signal))) + eps
+        clearance_factor = peak / (mean_sqrt_abs ** 2 + eps)
+
+        if len(signal) > 2:
+            autocorr = np.sum(signal[:-1] * signal[1:]) / (np.sum(signal ** 2) + eps)
+        else:
+            autocorr = 0.0
+
+        return np.array([rms, peak, crest, std_val, skew_val, kurt_val,
+                         peak_to_peak, shape_factor, impulse_factor,
+                         clearance_factor, autocorr], dtype=np.float32)
+
+    @staticmethod
+    def extract_features_from_multichannel(signal: np.ndarray) -> np.ndarray:
+        if signal.ndim == 1 or signal.shape[1] == 1:
+            return FeatureExtractor.ews_features(signal.flatten())
+        n_channels = signal.shape[1]
+        all_feats = [FeatureExtractor.ews_features(signal[:, ch])
+                     for ch in range(n_channels)]
+        return np.mean(all_feats, axis=0)
+
+
+def _paderborn_label_from_path(mat_path: str) -> Tuple[str, int]:
+    """
+    [FIX-2] Determine Paderborn class from the BEARING FOLDER, not the
+    full path. Previously 'ka' matched '/kaggle/', collapsing every
+    'artificial' file to OuterRace.
+
+    Paderborn folder naming: ka## = artificial outer race,
+                             ki## = artificial inner race,
+                             kb## = artificial (variant) — treated as OuterRace.
+    Time-varying folders are named KA##/KI##/KB##; healthy folders are
+    'K001' or 'healthy'.
+    """
+    path_lower = mat_path.lower()
+    parent = os.path.basename(os.path.dirname(mat_path)).lower()
+
+    if 'healthy' in path_lower or parent.startswith('k0'):
+        return 'Normal', 0
+
+    # Artificial damage in Paderborn: ka## (outer), ki## (inner), kb## (outer)
+    if 'artificial' in path_lower:
+        if parent.startswith('ka') or parent.startswith('kb'):
+            return 'OuterRace', 2
+        if parent.startswith('ki'):
+            return 'InnerRace', 2
+
+    # Time-varying (accelerated life test): KA##, KI##, KB##
+    if 'time' in path_lower:
+        if parent.startswith('ka') or parent.startswith('kb'):
+            return 'OuterRace', 3
+        if parent.startswith('ki'):
+            return 'InnerRace', 3
+
+    return 'Normal', 0
+
+
+class CWRULoader:
+    def __init__(self, data_folder: str, config):
+        self.data_folder = data_folder
+        self.config = config
+        self.extractor = FeatureExtractor()
+
+    def load(self):
+        files = sorted(glob.glob(os.path.join(self.data_folder, "*.csv")))
+        if not files:
+            return np.array([]), np.array([]), np.array([]), np.array([]), []
+
+        all_windows, all_features, all_classes, all_severity, window_files = \
+            [], [], [], [], []
+
+        for fpath in files:
+            fname = os.path.basename(fpath).lower()
+            if "normal" in fname:
+                class_label = "Normal"
+            elif "ball" in fname:
+                class_label = "Ball"
+            elif "inner" in fname or "ir" in fname:
+                class_label = "InnerRace"
+            elif "outer" in fname or "or" in fname:
+                class_label = "OuterRace"
+            else:
+                continue
+
+            sev = 0
+            match = re.search(r'(\d+)', fname)
+            if match:
+                size = int(match.group(1))
+                if size == 7: sev = 1
+                elif size == 14: sev = 2
+                elif size == 21: sev = 3
+                elif size == 28: sev = 4
+
+            try:
+                df = pd.read_csv(fpath)
+                cols = df.columns.tolist()
+                de_col = next((c for c in cols if 'DE' in c.upper()), cols[0])
+                fe_col = next((c for c in cols if 'FE' in c.upper()),
+                              cols[1] if len(cols) > 1 else cols[0])
+                ba_col = next((c for c in cols if 'BA' in c.upper()),
+                              cols[2] if len(cols) > 2 else cols[0])
+
+                de = pd.to_numeric(df[de_col], errors='coerce').dropna().values.astype(np.float32)
+                fe = pd.to_numeric(df[fe_col], errors='coerce').dropna().values.astype(np.float32)
+                ba = pd.to_numeric(df[ba_col], errors='coerce').dropna().values.astype(np.float32)
+
+                min_len = min(len(de), len(fe), len(ba))
+                if min_len < self.config.window_size:
+                    continue
+                de, fe, ba = de[:min_len], fe[:min_len], ba[:min_len]
+
+                for start in range(0, min_len - self.config.window_size + 1,
+                                   self.config.stride):
+                    de_win = de[start:start + self.config.window_size]
+                    fe_win = fe[start:start + self.config.window_size]
+                    ba_win = ba[start:start + self.config.window_size]
+                    raw_win = np.stack([de_win, fe_win, ba_win], axis=1)
+                    feats = self.extractor.extract_features_from_multichannel(raw_win)
+                    all_windows.append(raw_win)
+                    all_features.append(feats)
+                    all_classes.append(class_label)
+                    all_severity.append(sev)
+                    window_files.append(fpath)
+            except Exception:
+                continue
+
+        if not all_windows:
+            return np.array([]), np.array([]), np.array([]), np.array([]), []
+
+        return (np.array(all_windows, dtype=np.float32),
+                np.array(all_features, dtype=np.float32),
+                np.array(all_classes),
+                np.array(all_severity, dtype=np.int32),
+                window_files)
+
+
+class PaderbornMultimodalLoader:
+    def __init__(self, root: str, config):
+        self.root = root
+        self.config = config
+        self.extractor = FeatureExtractor()
+        self.rng = np.random.RandomState(config.random_state)
+
+    def extract_mat_data(self, mat_path: str) -> Optional[dict]:
+        try:
+            mat = sio.loadmat(mat_path)
+            var_name = None
+            for key in mat.keys():
+                if key.startswith('N') and not key.startswith('__'):
+                    var_name = key
+                    break
+            if var_name is None:
+                return None
+            data_struct = mat[var_name]
+            if data_struct.shape == (1, 1):
+                data_struct = data_struct[0, 0]
+
+            result = {'vibration': None, 'current_1': None, 'current_2': None,
+                      'temperature': None, 'class': None, 'severity': 0}
+
+            if hasattr(data_struct, 'dtype') and 'Y' in data_struct.dtype.names:
+                Y = data_struct['Y']
+                if Y.shape == (1, 7):
+                    for i in range(Y.shape[1]):
+                        item = Y[0, i]
+                        name = item['Name'][0] if item['Name'].size > 0 else f"signal_{i}"
+                        data_arr = item['Data']
+                        if hasattr(data_arr, 'shape') and data_arr.size > 0:
+                            signal = data_arr.flatten().astype(np.float32)
+                            if name == 'vibration_1':
+                                result['vibration'] = signal
+                            elif name == 'phase_current_1':
+                                result['current_1'] = signal
+                            elif name == 'phase_current_2':
+                                result['current_2'] = signal
+                            elif name == 'temp_2_bearing_module':
+                                result['temperature'] = signal
+
+            if result['vibration'] is None and hasattr(data_struct, 'dtype') \
+                    and 'X' in data_struct.dtype.names:
+                X = data_struct['X']
+                for i in range(X.shape[1]):
+                    item = X[0, i]
+                    data_arr = item['Data']
+                    if hasattr(data_arr, 'shape') and data_arr.size > 0:
+                        result['vibration'] = data_arr.flatten().astype(np.float32)
+                        break
+
+            if result['vibration'] is None:
+                return None
+
+            vib_len = len(result['vibration'])
+            if result['current_1'] is None:
+                result['current_1'] = np.zeros(vib_len, dtype=np.float32)
+            if result['current_2'] is None:
+                result['current_2'] = np.zeros(vib_len, dtype=np.float32)
+            if result['temperature'] is None or len(result['temperature']) == 0:
+                result['temperature'] = np.zeros(vib_len, dtype=np.float32)
+            elif len(result['temperature']) < vib_len:
+                result['temperature'] = np.interp(
+                    np.linspace(0, 1, vib_len),
+                    np.linspace(0, 1, len(result['temperature'])),
+                    result['temperature']).astype(np.float32)
+
+            # [FIX-2] Use parent-folder based label detection.
+            cls, sev = _paderborn_label_from_path(mat_path)
+            result['class'] = cls
+            result['severity'] = sev
+            return result
+        except Exception:
+            return None
+
+    def load_balanced_subset(self, total_files=250, max_windows_per_file=50):
+        all_vib, all_ews, all_classes, all_severity, all_files = [], [], [], [], []
+
+        healthy_files, artificial_files, time_files = [], [], []
+        for subfolder in ['healthy', 'artificial', 'time']:
+            subpath = os.path.join(self.root, subfolder)
+            if os.path.exists(subpath):
+                for root, dirs, files in os.walk(subpath):
+                    for file in files:
+                        if file.endswith('.mat'):
+                            fpath = os.path.join(root, file)
+                            if 'healthy' in fpath.lower():
+                                healthy_files.append(fpath)
+                            elif 'artificial' in fpath.lower():
+                                artificial_files.append(fpath)
+                            elif 'time' in fpath.lower():
+                                time_files.append(fpath)
+
+        print(f"  Found: {len(healthy_files)} healthy, "
+              f"{len(artificial_files)} artificial, {len(time_files)} time")
+
+        files_per_category = total_files // 3
+        remaining = total_files % 3
+        selected_files = []
+        categories = [('healthy', healthy_files),
+                      ('artificial', artificial_files),
+                      ('time', time_files)]
+        for i, (cat_name, cat_files) in enumerate(categories):
+            n_to_take = files_per_category + (1 if i < remaining else 0)
+            n_to_take = min(n_to_take, len(cat_files))
+            if n_to_take > 0 and len(cat_files) > 0:
+                sampled = self.rng.choice(len(cat_files), n_to_take, replace=False)
+                sampled_files = [cat_files[idx] for idx in sampled]
+                selected_files.extend(sampled_files)
+                print(f"    Selected {len(sampled_files)} files from {cat_name}")
+
+        print(f"  Total selected: {len(selected_files)} files")
+
+        loaded_count = 0
+        for fpath in selected_files:
+            data = self.extract_mat_data(fpath)
+            if data and data['vibration'] is not None:
+                vib = data['vibration']
+                if len(vib) >= self.config.window_size:
+                    current_1 = data['current_1']
+                    current_2 = data['current_2']
+                    temperature = data['temperature']
+
+                    total_windows = (len(vib) - self.config.window_size) // self.config.stride + 1
+                    windows_to_take = min(max_windows_per_file, total_windows)
+                    if windows_to_take < total_windows:
+                        step = total_windows // windows_to_take
+                        start_positions = list(range(0, total_windows, step))[:windows_to_take]
+                    else:
+                        start_positions = range(total_windows)
+
+                    for start_idx in start_positions:
+                        start = start_idx * self.config.stride
+                        vib_win = vib[start:start + self.config.window_size]
+                        cur1_win = current_1[start:start + self.config.window_size]
+                        cur2_win = current_2[start:start + self.config.window_size]
+                        temp_win = temperature[start:start + self.config.window_size]
+
+                        raw_win = np.stack([vib_win, cur1_win, cur2_win, temp_win], axis=1)
+                        feats = self.extractor.ews_features(vib_win)
+
+                        all_vib.append(raw_win)
+                        all_ews.append(feats)
+                        all_classes.append(data['class'])
+                        all_severity.append(data['severity'])
+                        all_files.append(fpath)
+                    loaded_count += 1
+
+        print(f"  ✅ Loaded {loaded_count} files, Created {len(all_vib)} windows")
+
+        if not all_vib:
+            return np.array([]), np.array([]), np.array([]), np.array([]), [], []
+
+        return (np.array(all_vib, dtype=np.float32),
+                np.array(all_ews, dtype=np.float32),
+                np.array(all_classes),
+                np.array(all_severity, dtype=np.float32),
+                all_files,
+                [])
+
+
+class PronostiaLoader:
+    def __init__(self, root: str, config):
+        self.root = root
+        self.config = config
+        self.extractor = FeatureExtractor()
+
+    def load_train_data(self, max_windows=2000, use_learning_set=True):
+        if use_learning_set:
+            search_path = os.path.join(self.root, "Learning_set", "**", "acc_*.csv")
+            print(f"  Loading from Learning_set")
+        else:
+            search_path = os.path.join(self.root, "Full_Test_Set", "**", "acc_*.csv")
+            print(f"  Loading from Full_Test_Set")
+
+        acc_files = sorted(glob.glob(search_path, recursive=True))
+        if not acc_files:
+            return (np.array([]), np.array([]), np.array([]),
+                    np.array([]), np.array([]), np.array([]))
+
+        bearing_files = defaultdict(list)
+        for f in acc_files:
+            parent = os.path.basename(os.path.dirname(f))
+            bearing_files[parent].append(f)
+        for bearing in bearing_files:
+            bearing_files[bearing] = sorted(bearing_files[bearing])
+
+        print(f"  Found {len(bearing_files)} bearings: {list(bearing_files.keys())}")
+
+        all_windows, all_features, all_rul = [], [], []
+        all_bearings, all_temporal_positions = [], []
+        n_bearings = len(bearing_files)
+
+        if not use_learning_set:
+            samples_per_bearing = max(1, max_windows // n_bearings)
+            print(f"  Taking {samples_per_bearing} samples per bearing "
+                  f"({n_bearings} bearings)")
+        else:
+            samples_per_bearing = max_windows
+
+        for bearing_name in sorted(bearing_files.keys()):
+            files = sorted(bearing_files[bearing_name])
+            n_samples = len(files)
+
+            # ---- Per-bearing decay rate estimation ----
+            rms_per_file = np.zeros(n_samples, dtype=np.float64)
+            n_loaded = 0
+            for i in range(n_samples):
+                try:
+                    with open(files[i], 'r') as f:
+                        first_line = f.readline().strip()
+                    delim = ';' if ';' in first_line else ','
+                    df = pd.read_csv(files[i], header=None, delimiter=delim)
+                    arr = df.values.astype(np.float32)
+                    if arr.shape[1] >= 6:
+                        vib_h = arr[:, 4]
+                    elif arr.shape[1] >= 2:
+                        vib_h = arr[:, 0]
+                    else:
+                        continue
+                    rms_per_file[i] = float(np.sqrt(np.mean(vib_h ** 2)))
+                    n_loaded += 1
+                except Exception:
+                    continue
+
+            if n_loaded >= 20:
+                k_i, alpha_i = self._estimate_k_and_alpha_from_rms(
+                                            rms_per_file, bearing_name=bearing_name)
+            else:
+                k_i = self.config.rul_decay_k
+                alpha_i = self.config.rul_alpha 
+            print(f"      Estimated k_i = {k_i:.3f}")
+            if not hasattr(self, '_k_map'):
+                self._k_map = {}
+            self._k_map[bearing_name] = k_i
+            if not hasattr(self, '_alpha_map'):
+                self._alpha_map = {}
+            self._alpha_map[bearing_name] = alpha_i
+
+            total_life = n_samples
+            print(f"    Bearing {bearing_name}: {n_samples} samples, "
+                  f"total life: {total_life}")
+
+            if use_learning_set:
+                take_count = min(n_samples, max_windows - len(all_windows))
+            else:
+                take_count = min(samples_per_bearing, n_samples)
+
+            if take_count < n_samples and not use_learning_set:
+                step = n_samples // take_count
+                indices_to_take = list(range(0, n_samples, step))[:take_count]
+            else:
+                indices_to_take = range(min(n_samples, take_count))
+
+            bearing_samples_taken = 0
+            for i in indices_to_take:
+                if len(all_windows) >= max_windows and use_learning_set:
+                    break
+                try:
+                    fpath = files[i]
+                    with open(fpath, 'r') as f:
+                        first_line = f.readline().strip()
+                    delimiter = ';' if ';' in first_line else ','
+                    df = pd.read_csv(fpath, header=None, delimiter=delimiter)
+                    data = df.values.astype(np.float32)
+
+                    if data.shape[1] >= 6:
+                        vib_h = data[:, 4]
+                        vib_v = data[:, 5]
+                    elif data.shape[1] >= 2:
+                        vib_h = data[:, 0]
+                        vib_v = data[:, 1]
+                    else:
+                        continue
+
+                    if len(vib_h) > self.config.window_size:
+                        vib_h = vib_h[:self.config.window_size]
+                        vib_v = vib_v[:self.config.window_size]
+                    elif len(vib_h) < self.config.window_size:
+                        pad = self.config.window_size - len(vib_h)
+                        vib_h = np.pad(vib_h, (0, pad))
+                        vib_v = np.pad(vib_v, (0, pad))
+
+                    raw_win = np.stack([vib_h, vib_v], axis=1)
+                    feats = self.extractor.extract_features_from_multichannel(raw_win)
+
+                    current_time = i
+                    temporal_pos = current_time / total_life
+                    rul = self._piecewise_exponential_rul(
+                        temporal_pos,
+                        k=k_i,
+                        alpha=alpha_i,
+                        mode=getattr(self.config, 'rul_target_mode', 'power'))
+
+                    all_windows.append(raw_win)
+                    all_features.append(feats)
+                    all_rul.append(rul)
+                    all_bearings.append(bearing_name)
+                    all_temporal_positions.append(temporal_pos)
+                    bearing_samples_taken += 1
+                except Exception:
+                    continue
+
+            print(f"      Loaded {bearing_samples_taken} windows from {bearing_name}")
+            if len(all_windows) >= max_windows and use_learning_set:
+                break
+
+        if not all_windows:
+            return (np.array([]), np.array([]), np.array([]),
+                    np.array([]), np.array([]), np.array([]))
+
+        all_windows = np.array(all_windows, dtype=np.float32)
+        all_features = np.array(all_features, dtype=np.float32)
+        all_rul = np.array(all_rul, dtype=np.float32)
+        all_bearings = np.array(all_bearings)
+        all_temporal_positions = np.array(all_temporal_positions, dtype=np.float32)
+
+        print(f"\n  ✅ Final: {len(all_windows)} windows from "
+              f"{len(np.unique(all_bearings))} bearings")
+        print(f"  Bearings: {list(np.unique(all_bearings))}")
+        print(f"  RUL stats: min={all_rul.min():.4f}, max={all_rul.max():.4f}, "
+              f"mean={all_rul.mean():.4f}")
+
+        return (all_windows, all_features, all_rul,
+                np.array(['pronostia'] * len(all_windows)),
+                all_bearings, all_temporal_positions)
+
+    @staticmethod
+    def _piecewise_exponential_rul(tau: float,
+                                   k: float = 5.0,
+                                   alpha: float = 2.0,
+                                   mode: str = 'power',
+                                   **_ignored) -> float:
+        """
+        RUL target.  `mode` selects the functional form.
+
+        'power'   : y = 1 - tau^alpha                 (Paris-shaped; current default)
+        'kinked'  : y = 1 - tau              for tau < 0.9
+                    y = 10*(1 - tau)         for tau >= 0.9  (explicitly non-Paris)
+        'expo'    : y = (e^{-k tau^a} - e^{-k}) / (1 - e^{-k})
+                                                (Dhibi-style; not a clean power law)
+
+        The 'kinked' and 'expo' modes are diagnostics: they test whether
+        a Paris prior helps when the target does NOT follow Paris law.
+        For those modes the analytic C=alpha, m=(alpha-1)/alpha is
+        intentionally mismatched — that is the point of the test.
+        """
+        tau = float(np.clip(tau, 0.0, 1.0))
+        if mode == 'kinked':
+            y = 1.0 - tau if tau < 0.9 else 10.0 * (1.0 - tau)
+            return float(np.clip(y, 0.0, 1.0))
+        if mode == 'expo':
+            num = np.exp(-k * (tau ** alpha)) - np.exp(-k)
+            den = 1.0 - np.exp(-k)
+            return float(np.clip(num / den, 0.0, 1.0))
+        return float(np.clip(1.0 - tau ** alpha, 0.0, 1.0))
+    @staticmethod
+    def _estimate_k_and_alpha_from_rms(
+            rms_per_file: np.ndarray,
+            default_k: float = 5.0,
+            default_alpha: float = 2.0,
+            bearing_name: str = "",
+    ) -> Tuple[float, float]:
+        """
+        [FIX-K3] Joint (k, α) estimation from the RMS trajectory.
+    
+        Fit log(RMS) = c + γ · log(τ) on the late-life window
+        [0.85n, 0.98n). Then:
+    
+            α_i = 1 + γ_i        → per-bearing shape exponent of the target
+            k_i = default_k      → fixed; the target's overall decay rate
+                                   is fully determined by α_i
+    
+        Because the Paris exponent induced by the target is
+        m = (α − 1) / α = γ / (1 + γ), per-bearing γ gives per-bearing m.
+        We clip α to [1.3, 3.0], so m ∈ [0.231, 0.667].
+        """
+        n = len(rms_per_file)
+        if n < 30:
+            return default_k, default_alpha
+    
+        start = int(0.85 * n)
+        end = max(start + 8, int(0.98 * n))
+        if end - start < 8:
+            return default_k, default_alpha
+    
+        rms_win = np.clip(rms_per_file[start:end], 1e-12, None)
+    
+        # τ in RAW sample indices (not normalized), because we want the
+        # power-law exponent γ, not the slope in a window-dependent scale.
+        tau = np.arange(start, end, dtype=np.float64)
+    
+        try:
+            log_tau = np.log(tau)
+            log_rms = np.log(rms_win)
+            gamma, c = np.polyfit(log_tau, log_rms, 1)
+        except Exception:
+            return default_k, default_alpha
+    
+        if not np.isfinite(gamma):
+            return default_k, default_alpha
+    
+        # α = 1 + γ. If γ < 0, the RMS is decreasing; treat as "no
+        # degradation" and use the flattest meaningful α.
+        # [FIX-K4] Soft saturation instead of hard clip. Linear α = 1 + γ
+        # sends 5 of 6 training bearings to the upper clip (α=3), collapsing
+        # per-bearing adaptivity to two modes. tanh saturation preserves
+        # ordering while giving ≥4 distinct α values on the training set.
+        alpha_i = 1.0 + 2.0 * float(np.tanh(gamma / 2.0))
+        alpha_i = float(np.clip(alpha_i, 1.3, 3.0))
+    
+        k_i = float(default_k)
+    
+        if bearing_name:
+            m_i = (alpha_i - 1.0) / alpha_i
+            print(f"      [k-α fit] {bearing_name}: "
+                  f"γ={gamma:+.4f} → α={alpha_i:.3f} (m={m_i:.3f})  "
+                  f"n={end - start}")
+    
+        return k_i, alpha_i
+
+
+def augment_paderborn_data(X_vib, X_ews, y_class, severity, augmentation_factor=1):
+    print(f"\n🔄 Augmenting Paderborn data (factor: {augmentation_factor}x)...")
+    X_vib_list = list(X_vib)
+    X_ews_list = list(X_ews)
+    y_class_list = list(y_class)
+    severity_list = list(severity)
+    original_len = len(X_vib_list)
+
+    for i in range(original_len):
+        if y_class_list[i] == 'InnerRace' or np.random.rand() < 0.5:
+            noise_std = 0.05 * np.std(X_vib_list[i])
+            noisy_vib = X_vib_list[i] + np.random.normal(
+                0, noise_std, X_vib_list[i].shape)
+            X_vib_list.append(noisy_vib.astype(np.float32))
+            X_ews_list.append(X_ews_list[i].copy())
+            y_class_list.append(y_class_list[i])
+            severity_list.append(severity_list[i])
+
+            shift = np.random.randint(100, 500)
+            shifted_vib = np.roll(X_vib_list[i], shift, axis=0)
+            X_vib_list.append(shifted_vib.astype(np.float32))
+            X_ews_list.append(X_ews_list[i].copy())
+            y_class_list.append(y_class_list[i])
+            severity_list.append(severity_list[i])
+
+            scale = np.random.uniform(0.8, 1.2)
+            scaled_vib = X_vib_list[i] * scale
+            X_vib_list.append(scaled_vib.astype(np.float32))
+            X_ews_list.append(X_ews_list[i].copy())
+            y_class_list.append(y_class_list[i])
+            severity_list.append(severity_list[i])
+
+    X_vib_aug = np.array(X_vib_list, dtype=np.float32)
+    X_ews_aug = np.array(X_ews_list, dtype=np.float32)
+    y_class_aug = np.array(y_class_list)
+    severity_aug = np.array(severity_list)
+
+    assert len(X_vib_aug) == len(X_ews_aug) == len(y_class_aug) == len(severity_aug)
+    print(f"  Original: {original_len} samples → Augmented: {len(X_vib_aug)} samples")
+    print(f"  Augmentation ratio: {len(X_vib_aug) / original_len:.1f}x")
+    return X_vib_aug, X_ews_aug, y_class_aug, severity_aug
+
+
+# =============================================================
+# §4  PER-SEQUENCE DATASET BUILDER
+# =============================================================
+
+class PerSequenceDataset:
+    def __init__(self, X_vib, X_ews, y_rul, bearings, temporal, window_size):
+        assert len(X_vib) == len(y_rul) == len(bearings) == len(temporal)
+        self.X_vib = X_vib
+        self.X_ews = X_ews
+        self.y_rul = y_rul
+        self.bearings_array = bearings
+        self.temporal = temporal
+        self.window_size = window_size
+
+        self.sequences = defaultdict(dict)
+        for b in np.unique(bearings):
+            mask = bearings == b
+            order = np.argsort(temporal[mask])
+            self.sequences[b] = {
+                'X_vib': X_vib[mask][order],
+                'X_ews': X_ews[mask][order],
+                'rul': y_rul[mask][order],
+                'temporal': temporal[mask][order],
+                'n': int(mask.sum()),
+            }
+
+    def get(self, bearing):
+        seq = self.sequences[bearing]
+        seq['kurtosis'] = seq['X_ews'][:, 5]
+        return seq
+
+    def bearings(self):
+        return sorted(self.sequences.keys())
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __iter__(self):
+        for b in self.bearings():
+            yield b, self.sequences[b]
+
+
+# =============================================================
+# §5  GPR RATE ESTIMATOR
+# =============================================================
+
+class GPRRateEstimator:
+    def __init__(self, kernel_type='matern', length_scale=5.0, noise=1e-3,
+                 n_restarts=3, normalize_y=True):
+        self.kernel_type = kernel_type
+        self.length_scale = length_scale
+        self.noise = noise
+        self.n_restarts = n_restarts
+        self.normalize_y = normalize_y
+
+    def _build_kernel(self):
+        if self.kernel_type == 'rbf':
+            return (C_kernel(1.0, (1e-3, 1e3))
+                    * RBF(self.length_scale, (1e-2, 1e3))
+                    + WhiteKernel(self.noise, (1e-6, 1e-1)))
+        elif self.kernel_type == 'matern':
+            return (C_kernel(1.0, (1e-3, 1e3))
+                    * Matern(self.length_scale, nu=1.5,
+                             length_scale_bounds=(1e-2, 1e3))
+                    + WhiteKernel(self.noise, (1e-6, 1e-1)))
+        elif self.kernel_type == 'white':
+            return C_kernel(1.0) + WhiteKernel(self.noise, (1e-6, 1e-1))
+        else:
+            raise ValueError(f"Unknown kernel: {self.kernel_type}")
+
+    def fit_predict(self, t, y, max_points=300):
+        t = np.asarray(t, dtype=np.float64).reshape(-1, 1)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+
+        if len(t) < 4:
+            dy = np.gradient(y, t.ravel())
+            return {'y_smooth': y.copy(), 'y_std': np.full_like(y, np.nan),
+                    'sigma2': np.full_like(y, np.nan),
+                    'dy_dt': dy, 'dy_dt_std': np.full_like(dy, np.nan)}
+
+        if len(t) > max_points:
+            idx = np.linspace(0, len(t) - 1, max_points).astype(int)
+            t_fit = t[idx]
+            y_fit = y[idx]
+        else:
+            t_fit = t
+            y_fit = y
+
+        kernel = self._build_kernel()
+        gp = GaussianProcessRegressor(kernel=kernel,
+                                      n_restarts_optimizer=self.n_restarts,
+                                      normalize_y=self.normalize_y,
+                                      alpha=1e-10)
+        gp.fit(t_fit, y_fit)
+        print(f"      [GPR] type={self.kernel_type}  "
+              f"n_fit={len(t_fit)}  fitted={gp.kernel_}  "
+              f"LML={gp.log_marginal_likelihood_value_:.3f}")
+        y_smooth, y_std = gp.predict(t, return_std=True)
+        sigma2 = y_std ** 2
+        dy_dt = np.gradient(y_smooth, t.ravel())
+
+        dt = np.gradient(t.ravel())
+        dy_dt_std = np.zeros_like(dy_dt)
+        for i in range(1, len(dy_dt) - 1):
+            dy_dt_std[i] = np.sqrt(sigma2[i - 1] + sigma2[i + 1]) / (2 * max(dt[i], 1e-8))
+        dy_dt_std[0] = dy_dt_std[1] if len(dy_dt_std) > 1 else 0.0
+        dy_dt_std[-1] = dy_dt_std[-2] if len(dy_dt_std) > 1 else 0.0
+
+        return {'y_smooth': y_smooth, 'y_std': y_std, 'sigma2': sigma2,
+                'dy_dt': dy_dt, 'dy_dt_std': dy_dt_std}
+
+    def fit_sequence(self, sequence):
+        return self.fit_predict(sequence['temporal'], sequence['rul'])
+
+
+# =============================================================
+# §6  BOUNDED UNCERTAINTY-WEIGHTED LSQ PARAMETER ESTIMATOR
+# =============================================================
+
+class BoundedLSQParameterEstimator:
+    """Bounded LSQ for Paris (C, m) on damage D = 1 - RUL."""
+
+    def __init__(self, C_bounds=(1e-12, 1e2), m_bounds=(0.5, 6.0),
+                 use_loglog_fallback=True, condition_threshold=1e6,
+                 sigma_eps=1e-6):
+        self.C_bounds = C_bounds
+        self.m_bounds = m_bounds
+        self.use_loglog_fallback = use_loglog_fallback
+        self.condition_threshold = condition_threshold
+        self.sigma_eps = sigma_eps
+
+    def _residual(self, params, y, dy, weights):
+        # dD/dtau - C * D^m   (D = damage, dy = dD/dtau > 0)
+        # WLS objective is sum_t weights[t] * residual[t]^2, so return
+        # sqrt(weights) * residual; the minimize call squares it again.
+        logC, m = params
+        C = np.exp(logC)
+        y_safe = np.clip(y, 1e-6, 1.0)
+        return np.sqrt(weights) * (dy - C * (y_safe ** m))
+
+    def fit(self, y, dy, sigma2):
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        dy = np.asarray(dy, dtype=np.float64).reshape(-1)
+        sigma2 = np.asarray(sigma2, dtype=np.float64).reshape(-1)
+
+        if len(y) < 4:
+            return self._fallback_loglog(y, dy)
+
+        w = 1.0 / (sigma2 + self.sigma_eps)
+        w = w / (np.mean(w) + 1e-12)
+
+        y_safe = np.clip(y, 1e-4, 1.0)
+        rate = np.clip(dy, 1e-12, None)
+
+        try:
+            log_rate = np.log(rate)
+            log_y = np.log(y_safe)
+            A = np.vstack([np.ones_like(log_y), log_y]).T
+            Aw = A * np.sqrt(w)[:, None]
+            coef, *_ = np.linalg.lstsq(Aw, np.sqrt(w) * log_rate, rcond=None)
+            logC0, m0 = coef
+            m0 = np.clip(m0, *self.m_bounds)
+            logC0 = np.clip(logC0, np.log(self.C_bounds[0]),
+                            np.log(self.C_bounds[1]))
+            x0 = np.array([logC0, m0])
+        except Exception:
+            x0 = np.array([np.log(1e-6), 3.0])
+
+        try:
+            J = np.zeros((len(y_safe), 2))
+            J[:, 0] = 1.0
+            J[:, 1] = (y_safe ** x0[1]) * np.log(y_safe)
+            JW = J * np.sqrt(w)[:, None]
+            JTJ = JW.T @ JW
+            cond = np.linalg.cond(JTJ)
+        except Exception:
+            cond = np.inf
+
+        if cond > self.condition_threshold and self.use_loglog_fallback:
+            return self._fallback_loglog(y, rate, cond=cond)
+
+        bounds = [(np.log(self.C_bounds[0]), np.log(self.C_bounds[1])),
+                  (self.m_bounds[0], self.m_bounds[1])]
+
+        try:
+            res = minimize(
+                lambda p: np.sum(self._residual(p, y_safe, dy, w) ** 2),
+                x0=x0, bounds=bounds, method='L-BFGS-B',
+                options={'maxiter': 200, 'ftol': 1e-12})
+            logC, m = res.x
+            r_init = float(np.sum(self._residual(x0, y_safe, dy, w) ** 2))
+            r_sol = float(np.sum(self._residual(res.x, y_safe, dy, w) ** 2))
+            reduction = r_init / (r_sol + 1e-30)
+            print(f"      [LSQ] J_init={r_init:.4e}  J_sol={r_sol:.4e}  "
+                  f"reduction={reduction:.2f}x  cond={cond:.2e}")
+            return {'C': float(np.exp(logC)), 'm': float(m),
+                    'converged': bool(res.success),
+                    'condition_number': float(cond),
+                    'method': 'bounded_lsq',
+                    'J_init': r_init, 'J_sol': r_sol}
+        except Exception:
+            return self._fallback_loglog(y, rate, cond=cond)
+
+    def _fallback_loglog(self, y, rate, cond=np.inf):
+        y_safe = np.clip(y, 1e-4, 1.0)
+        rate_safe = np.clip(rate, 1e-12, None)
+        try:
+            log_y = np.log(y_safe)
+            log_rate = np.log(rate_safe)
+            A = np.vstack([np.ones_like(log_y), log_y]).T
+            coef, *_ = np.linalg.lstsq(A, log_rate, rcond=None)
+            logC, m = coef
+            C = float(np.clip(np.exp(logC), *self.C_bounds))
+            m = float(np.clip(m, *self.m_bounds))
+            return {'C': C, 'm': m, 'converged': True,
+                    'condition_number': float(cond),
+                    'method': 'loglog_fallback'}
+        except Exception:
+            return {'C': 1e-6, 'm': 3.0, 'converged': False,
+                    'condition_number': float(cond),
+                    'method': 'default'}
+
+    def fit_dataset(self, per_sequence, gpr):
+        out = {}
+        for bearing in per_sequence.bearings():
+            seq = per_sequence.get(bearing)
+            gpr_out = gpr.fit_predict(seq['temporal'], 1.0 - seq['rul'])
+            y_smooth = gpr_out['y_smooth']
+            dy_dt = gpr_out['dy_dt']
+            sigma2 = gpr_out['sigma2']
+            sigma2 = np.where(np.isnan(sigma2), np.nanmedian(sigma2), sigma2)
+
+            y_use = np.clip(y_smooth, 1e-6, 1.0)
+            out[bearing] = self.fit(y_use, dy_dt, sigma2)
+            out[bearing]['n_points'] = int(len(y_use))
+
+            C = out[bearing]['C']
+            m = out[bearing]['m']
+            pred_rate_mid = C * (np.median(y_use) ** m)
+            obs_rate_med = float(np.median(np.abs(dy_dt)))
+            ratio = pred_rate_mid / (obs_rate_med + 1e-12)
+            print(f"    [{bearing}] obs_med|dD/dt|={obs_rate_med:.4e}  "
+                  f"C*D_mid^m={pred_rate_mid:.4e}  ratio={ratio:.4f}  "
+                  f"method={out[bearing]['method']}")
+        return out
+
+
+# =============================================================
+# §7  ADAPTIVE PHYSICS LOSSES
+# =============================================================
+
+class AdaptivePhysicsLosses:
+    def __init__(self, huber_delta=0.05, use_huber=True, sigma_eps=1e-6):
+        self.huber_delta = huber_delta
+        self.use_huber = use_huber
+        self.sigma_eps = sigma_eps
+
+    def _huber(self, r):
+        abs_r = tf.abs(r)
+        quad = 0.5 * tf.square(r)
+        lin = self.huber_delta * (abs_r - 0.5 * self.huber_delta)
+        return tf.where(abs_r < self.huber_delta, quad, lin)
+
+    def _residual(self, r):
+        return self._huber(r) if self.use_huber else tf.square(r)
+
+    @tf.function(reduce_retracing=True)
+    def monotonicity_loss(self, damage, cycles, weights=None):
+        damage = tf.reshape(damage, [-1])
+        cycles = tf.reshape(cycles, [-1])
+        if tf.size(damage) < 2:
+            return tf.constant(0.0)
+        idx = tf.argsort(cycles)
+        d = tf.gather(damage, idx)
+        v = tf.nn.relu(d[:-1] - d[1:])
+        if weights is not None:
+            w = tf.gather(weights, idx)[:-1]
+            v = v * w
+        return tf.reduce_mean(v)
+
+    @tf.function(reduce_retracing=True)
+    def consistency_loss(self, damage, rul, weights=None):
+        damage = tf.reshape(damage, [-1])
+        rul = tf.reshape(rul, [-1])
+        eps = 1e-6
+        d_norm = (damage - tf.reduce_min(damage)) / (
+            tf.reduce_max(damage) - tf.reduce_min(damage) + eps)
+        r = d_norm + rul - 1.0
+        h = self._residual(r)
+        if weights is not None:
+            h = h * tf.reshape(weights, [-1])
+        return tf.reduce_mean(h)
+
+    @tf.function(reduce_retracing=True)
+    def paris_law_loss(self, rul_pred, cycles, C_seq, m_seq, seq_ids, weights=None):
+        y = tf.reshape(rul_pred, [-1])
+        c = tf.reshape(cycles, [-1])
+        C_s = tf.reshape(C_seq, [-1])
+        m_s = tf.reshape(m_seq, [-1])
+        s = tf.reshape(seq_ids, [-1])
+        if tf.size(y) < 2:
+            return tf.constant(0.0)
+
+        sort_key = tf.cast(s, tf.float32) * 1000.0 + c
+        idx = tf.argsort(sort_key)
+        y = tf.gather(y, idx); c = tf.gather(c, idx)
+        C_s = tf.gather(C_s, idx); m_s = tf.gather(m_s, idx); s = tf.gather(s, idx)
+
+        same_seq = tf.cast(tf.equal(s[1:], s[:-1]), tf.float32)
+
+        D = 1.0 - y
+        delta_D = D[1:] - D[:-1]
+        delta_c = c[1:] - c[:-1] + 1e-8
+        D_t = tf.maximum(D[:-1], 1e-6)
+        C_mid = 0.5 * (C_s[1:] + C_s[:-1])
+        m_mid = 0.5 * (m_s[1:] + m_s[:-1])
+
+        residual = delta_D / delta_c - C_mid * tf.pow(D_t, m_mid)
+        h = self._residual(residual) * same_seq
+        if weights is not None:
+            w = tf.gather(weights, idx)[:-1] * same_seq
+            h = h * w
+        denom = tf.reduce_sum(same_seq) + 1e-8
+        return tf.reduce_sum(h) / denom
+
+
+# =============================================================
+# §8  PHYSICS CURRICULUM
+# =============================================================
+
+class PhysicsCurriculum:
+    def __init__(self, lambda_max_mono=0.05, lambda_max_paris=0.02,
+                 lambda_max_consist=0.05, k=0.3, c0=10.0):
+        self.lambda_max_mono = lambda_max_mono
+        self.lambda_max_paris = lambda_max_paris
+        self.lambda_max_consist = lambda_max_consist
+        self.k = k
+        self.c0 = c0
+
+    def _sigmoid(self, epoch):
+        return 1.0 / (1.0 + np.exp(-self.k * (epoch - self.c0)))
+
+    def at(self, epoch):
+        s = self._sigmoid(epoch)
+        return {'mono': self.lambda_max_mono * s,
+                'paris': self.lambda_max_paris * s,
+                'consist': self.lambda_max_consist * s}
+
+
+# =============================================================
+# §9  PHY METRIC
+# =============================================================
+
+class PHYMetric:
+    def __init__(self, eps: float = 1e-8):
+        self.eps = eps
+
+    def compute_sequence(self, rul_pred, temporal, C_seq, m_seq):
+        y = np.asarray(rul_pred, dtype=np.float64).reshape(-1)
+        t = np.asarray(temporal, dtype=np.float64).reshape(-1)
+        C_s = np.asarray(C_seq, dtype=np.float64).reshape(-1)
+        m_s = np.asarray(m_seq, dtype=np.float64).reshape(-1)
+        if len(y) < 3:
+            return {'phy': float('nan')}
+
+        order = np.argsort(t)
+        y = y[order]; t = t[order]; C_s = C_s[order]; m_s = m_s[order]
+
+        dt = np.diff(t) + self.eps
+        D = 1.0 - y
+        dD = np.diff(D)
+        D_t = np.maximum(D[:-1], 1e-6)
+        C_mid = 0.5 * (C_s[1:] + C_s[:-1])
+        m_mid = 0.5 * (m_s[1:] + m_s[:-1])
+
+        residual = dD / dt - C_mid * (D_t ** m_mid)
+        return {'phy': float(np.mean(np.abs(residual)))}
+
+    def compute_sequence_refit(self, rul_pred, temporal,
+                           C_bounds=(1e-12, 1e2), m_bounds=(0.2, 6.0)):
+        y = np.asarray(rul_pred, dtype=np.float64).reshape(-1)
+        t = np.asarray(temporal, dtype=np.float64).reshape(-1)
+        nan = float('nan')
+        if len(y) < 5:
+            return {'phy_refit': nan, 'C_refit': nan, 'm_refit': nan}
+
+        order = np.argsort(t)
+        y = y[order]; t = t[order]
+
+        dt = np.diff(t) + 1e-8
+        D = 1.0 - y
+        dD = np.diff(D)
+        rate = dD / dt
+        D_mid = np.clip(0.5 * (D[1:] + D[:-1]), 1e-6, 1.0)
+
+        mask = (rate > 1e-10) & (D_mid > 1e-6)
+        if mask.sum() < 4:
+            return {'phy_refit': nan, 'C_refit': nan, 'm_refit': nan}
+
+        log_D = np.log(D_mid[mask])
+        log_r = np.log(rate[mask])
+        A = np.vstack([np.ones_like(log_D), log_D]).T
+        coef, *_ = np.linalg.lstsq(A, log_r, rcond=None)
+        logC, m = coef
+        C = float(np.clip(np.exp(logC), *C_bounds))
+        m = float(np.clip(m, *m_bounds))
+
+        residual = rate - C * (D_mid ** m)
+        return {'phy_refit': float(np.mean(np.abs(residual))),
+                'C_refit': C, 'm_refit': m}
+
+    def compute_dataset(self, rul_per_bearing, temporal_per_bearing,
+                        C_per_bearing, m_per_bearing) -> Dict:
+        per_seq = {}
+        for b in rul_per_bearing:
+            per_seq[b] = self.compute_sequence(
+                rul_per_bearing[b],
+                temporal_per_bearing[b],
+                C_per_bearing[b],
+                m_per_bearing[b])
+        vals = np.array([per_seq[b]['phy'] for b in per_seq
+                         if not np.isnan(per_seq[b]['phy'])])
+        return {
+            'per_sequence': per_seq,
+            'macro_phy': float(np.mean(vals)) if len(vals) else float('nan'),
+            'median_phy': float(np.median(vals)) if len(vals) else float('nan'),
+            'std_phy': float(np.std(vals)) if len(vals) else float('nan'),
+        }
+
+
+# =============================================================
+# §10  MODEL ARCHITECTURE
+# =============================================================
+
+class GradientReversalLayer(layers.Layer):
+    def __init__(self, alpha=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.alpha = alpha
+
+    def call(self, inputs):
+        @tf.custom_gradient
+        def reverse_gradient(x):
+            def grad(dy):
+                return -self.alpha * dy
+            return x, grad
+        return reverse_gradient(inputs)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'alpha': self.alpha})
+        return cfg
+
+
+def build_model_v3(config, n_sequences):
+    multimodal_in = layers.Input(shape=(config.window_size, 4),
+                                 name='multimodal_input')
+    ews_in = layers.Input(shape=(11,), name='ews_features')
+    seq_in = layers.Input(shape=(1,), dtype=tf.int32, name='seq_index')
+
+    vib = layers.Lambda(lambda x: x[:, :, 0:1], name='extract_vibration')(multimodal_in)
+    current = layers.Lambda(lambda x: x[:, :, 1:3], name='extract_current')(multimodal_in)
+    temperature = layers.Lambda(lambda x: x[:, :, 3:4], name='extract_temperature')(multimodal_in)
+
+    vib_branches = []
+    for k in [3, 5, 7]:
+        x = layers.Conv1D(config.cnn_filters // 2, k, padding='same',
+                          activation='relu',
+                          kernel_regularizer=regularizers.l2(config.l2_reg))(vib)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling1D(2)(x)
+        vib_branches.append(x)
+    vib_merged = layers.concatenate(vib_branches)
+    vib_merged = layers.Conv1D(64, 3, padding='same', activation='relu',
+                                kernel_regularizer=regularizers.l2(config.l2_reg))(vib_merged)
+    vib_lstm = layers.Bidirectional(
+        layers.LSTM(config.lstm_units // 2, return_sequences=False,
+                    dropout=0.2, recurrent_dropout=0.0))(vib_merged)
+
+    cur_branches = []
+    for k in [3, 5]:
+        x = layers.Conv1D(16, k, padding='same', activation='relu',
+                          kernel_regularizer=regularizers.l2(config.l2_reg))(current)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling1D(2)(x)
+        cur_branches.append(x)
+    cur_merged = layers.concatenate(cur_branches)
+    cur_merged = layers.Conv1D(32, 3, padding='same', activation='relu',
+                                kernel_regularizer=regularizers.l2(config.l2_reg))(cur_merged)
+    cur_lstm = layers.Bidirectional(
+        layers.LSTM(32, return_sequences=False,
+                    dropout=0.2, recurrent_dropout=0.0))(cur_merged)
+
+    temp_conv = layers.Conv1D(16, 5, padding='same', activation='relu',
+                               kernel_regularizer=regularizers.l2(config.l2_reg))(temperature)
+    temp_conv = layers.BatchNormalization()(temp_conv)
+    temp_conv = layers.Conv1D(16, 3, activation='relu')(temp_conv)
+    temp_conv = layers.GlobalAveragePooling1D()(temp_conv)
+    temp_dense = layers.Dense(32, activation='relu',
+                               kernel_regularizer=regularizers.l2(config.l2_reg))(temp_conv)
+
+    if config.skip_ews:
+        e = layers.Lambda(lambda x: tf.zeros_like(x), name='ews_zero')(ews_in)
+        e = layers.Dense(16, activation='relu', name='ews_dummy')(e)
+    else:
+        e = layers.Dense(64, activation='relu',
+                         kernel_regularizer=regularizers.l2(config.l2_reg))(ews_in)
+        e = layers.BatchNormalization()(e)
+        e = layers.Dropout(config.dropout)(e)
+        e = layers.Dense(32, activation='relu',
+                         kernel_regularizer=regularizers.l2(config.l2_reg))(e)
+        e = layers.Dropout(config.dropout)(e)
+        e = layers.Dense(16, activation='relu')(e)
+
+    vib_proj = layers.Dense(64, activation='relu')(vib_lstm)
+    cur_proj = layers.Dense(64, activation='relu')(cur_lstm)
+    temp_proj = layers.Dense(64, activation='relu')(temp_dense)
+    ews_proj = layers.Dense(64, activation='relu')(e)
+
+    vib_seq = layers.Reshape((1, 64))(vib_proj)
+    cur_seq = layers.Reshape((1, 64))(cur_proj)
+    temp_seq = layers.Reshape((1, 64))(temp_proj)
+    ews_seq = layers.Reshape((1, 64))(ews_proj)
+
+    if config.lightweight_mode:
+        fused = layers.Concatenate()([vib_seq, cur_seq, temp_seq, ews_seq])
+    else:
+        vib_cur_attn = layers.MultiHeadAttention(num_heads=4, key_dim=16)(
+            query=cur_seq, key=vib_seq, value=vib_seq)
+        cur_vib_attn = layers.MultiHeadAttention(num_heads=4, key_dim=16)(
+            query=vib_seq, key=cur_seq, value=cur_seq)
+        combined_seq = layers.Concatenate()([vib_seq, cur_seq])
+        temp_all_attn = layers.MultiHeadAttention(num_heads=4, key_dim=16)(
+            query=temp_seq, key=combined_seq, value=combined_seq)
+        fused = layers.Concatenate()([vib_seq, cur_seq, temp_seq, ews_seq,
+                                       vib_cur_attn, cur_vib_attn, temp_all_attn])
+
+    combined = layers.Flatten()(fused)
+    combined = layers.Dropout(0.3)(combined)
+
+    for units in [64, 32]:
+        combined = layers.Dense(units, activation='relu',
+                                 kernel_regularizer=regularizers.l2(config.l2_reg))(combined)
+        combined = layers.BatchNormalization()(combined)
+        combined = layers.Dropout(config.dropout)(combined)
+
+    shared_features = layers.Dense(64, activation='relu')(combined)
+
+    seq_float = layers.Lambda(lambda x: tf.cast(x, tf.float32),
+                              name='seq_to_float')(seq_in)
+    seq_embed = layers.Dense(32, activation='tanh',
+                             kernel_initializer='zeros',
+                             bias_initializer='zeros',
+                             trainable=False,
+                             name='seq_embedding')(seq_float)
+    seq_contrib = layers.Dense(64, activation='linear',
+                               kernel_initializer='zeros',
+                               bias_initializer='zeros',
+                               trainable=False,
+                               name='seq_contribution')(seq_embed)
+
+    shared_features = layers.Add(name='shared_with_seq')(
+        [shared_features, seq_contrib])
+
+    if config.use_dann:
+        domain_features = GradientReversalLayer(alpha=0.1,
+                                                name='gradient_reversal')(combined)
+        d = layers.Dense(32, activation='relu',
+                         kernel_regularizer=regularizers.l2(config.l2_reg))(domain_features)
+        d = layers.BatchNormalization()(d)
+        d = layers.Dropout(0.3)(d)
+        domain_out = layers.Dense(2, activation='softmax', name='domain')(d)
+    else:
+        domain_out = layers.Lambda(
+            lambda x: tf.zeros_like(x)[:, :2], name='domain_dummy')(combined)
+
+    cluster_embedding = layers.Dense(16, activation='linear',
+                                     name='cluster_embedding')(combined)
+    shared_damage = layers.Dense(1, activation='sigmoid',
+                                 name='shared_damage')(combined)
+
+    cwru_logits = layers.Dense(config.cwru_classes, activation='linear',
+                               name='cwru_logits')(layers.Dropout(0.5)(shared_features))
+    if config.temperature_scaling != 1.0:
+        cwru_logits = layers.Lambda(lambda x: x / config.temperature_scaling,
+                                    name='cwru_temp_scaled')(cwru_logits)
+    cwru_out = layers.Activation('softmax', name='cwru_class')(cwru_logits)
+
+    paderborn_logits = layers.Dense(config.paderborn_classes, activation='linear',
+                                    name='paderborn_logits')(layers.Dropout(0.5)(shared_features))
+    if config.temperature_scaling != 1.0:
+        paderborn_logits = layers.Lambda(lambda x: x / config.temperature_scaling,
+                                         name='paderborn_temp_scaled')(paderborn_logits)
+    paderborn_out = layers.Activation('softmax', name='paderborn_class')(paderborn_logits)
+
+    pronostia_out = layers.Dense(1, activation='sigmoid',
+                                 name='pronostia_rul')(layers.Dropout(config.dropout)(shared_features))
+
+    return Model(
+        inputs=[multimodal_in, ews_in, seq_in],
+        outputs={'cwru_class': cwru_out,
+                 'paderborn_class': paderborn_out,
+                 'pronostia_rul': pronostia_out,
+                 'shared_damage': shared_damage,
+                 'cluster_embedding': cluster_embedding,
+                 'domain': domain_out},
+        name='mt_supinn_v3')
+
+
+# =============================================================
+# §11  TRAINER V3
+# =============================================================
+
+class MultiModalTrainerV3:
+    def __init__(self, model, config, C_table, m_table, curriculum):
+        self.model = model
+        self.config = config
+        self.optimizer = Adam(learning_rate=config.learning_rate, clipnorm=1.0)
+        self.physics = AdaptivePhysicsLosses(
+            huber_delta=config.huber_delta,
+            use_huber=config.use_huber_residual)
+        self.curriculum = curriculum
+        self.C_table = tf.constant(C_table, dtype=tf.float32)
+        self.m_table = tf.constant(m_table, dtype=tf.float32)
+        self.cluster_centers = None
+        self.current_epoch = 0
+
+    def _gather_seq_params(self, seq_idx):
+        idx = tf.reshape(seq_idx, [-1])
+        return tf.gather(self.C_table, idx), tf.gather(self.m_table, idx)
+
+    def clustering_loss(self, embeddings):
+        if self.cluster_centers is None:
+            return tf.constant(0.0)
+        e_norm = tf.math.l2_normalize(embeddings, axis=-1)
+        c_norm = tf.math.l2_normalize(self.cluster_centers, axis=-1)
+        sim = tf.matmul(e_norm, c_norm, transpose_b=True)
+        soft = tf.nn.softmax(sim / 1.0)
+        target = soft ** 2 / (tf.reduce_sum(soft, axis=0) + 1e-10)
+        target = target / (tf.reduce_sum(target, axis=-1, keepdims=True) + 1e-10)
+        return tf.reduce_mean(tf.reduce_sum(
+            target * tf.math.log(target / (soft + 1e-10)), axis=-1))
+
+    def initialize_cluster_centers(self, generator, num_clusters=5):
+        print(f"\n🔧 Initializing {num_clusters} cluster centers...")
+        all_embeddings = []
+        for batch_idx in range(min(len(generator), 20)):
+            inputs, _, _ = generator[batch_idx]
+            pred = self.model.predict(inputs, verbose=0)
+            all_embeddings.append(pred['cluster_embedding'])
+        all_embeddings = np.vstack(all_embeddings)[:1000]
+        kmeans = KMeans(n_clusters=num_clusters,
+                        random_state=self.config.random_state,
+                        n_init=10, init='k-means++')
+        kmeans.fit(all_embeddings)
+        self.cluster_centers = tf.constant(kmeans.cluster_centers_, dtype=tf.float32)
+        try:
+            sil = silhouette_score(all_embeddings, kmeans.labels_)
+            print(f"   ✅ Cluster centers set, silhouette={sil:.4f}")
+        except Exception:
+            print(f"   ✅ Cluster centers set")
+        return self.cluster_centers
+
+    @tf.function(reduce_retracing=True)
+    def _compute_losses(self, x_in, ews_in, seq_idx, y_cwru, y_paderborn,
+                        y_rul, dataset, cycles, weights, epoch_tensor,
+                        is_training):
+        """
+        Forward pass + loss computation. Does NOT apply gradients.
+        [FIX-1] `training=is_training` everywhere so BN/dropout behave
+                correctly in inference mode.
+        """
+        cwru_mask = tf.cast(tf.equal(dataset, 0), tf.float32)
+        pader_mask = tf.cast(tf.equal(dataset, 1), tf.float32)
+        pron_mask = tf.cast(tf.equal(dataset, 2), tf.float32)
+
+        if self.config.use_physics_curriculum:
+            epoch_f = tf.cast(epoch_tensor, tf.float32)
+            s = tf.sigmoid(self.curriculum.k * (epoch_f - self.curriculum.c0))
+            lam_mono = self.curriculum.lambda_max_mono * s
+            lam_paris = self.curriculum.lambda_max_paris * s
+            lam_consist = self.curriculum.lambda_max_consist * s
+        else:
+            lam_mono = tf.constant(self.config.alpha_mono, tf.float32)
+            lam_paris = tf.constant(self.config.beta_paris, tf.float32)
+            lam_consist = tf.constant(self.config.gamma_consist, tf.float32)
+
+        pred = self.model([x_in, ews_in, seq_idx], training=is_training)
+
+        y_cwru_r = tf.reshape(y_cwru, [-1, 4])
+        y_pader_r = tf.reshape(y_paderborn, [-1, 3])
+
+        loss_cwru = (tf.reduce_sum(cwru_mask * tf.keras.losses.categorical_crossentropy(
+            y_cwru_r, pred['cwru_class']))
+            / (tf.reduce_sum(cwru_mask) + 1e-8))
+        loss_pader = (tf.reduce_sum(pader_mask * tf.keras.losses.categorical_crossentropy(
+            y_pader_r, pred['paderborn_class']))
+            / (tf.reduce_sum(pader_mask) + 1e-8))
+
+        y_rul_r = tf.reshape(y_rul, [-1])
+        pred_rul = tf.reshape(pred['pronostia_rul'], [-1])
+        err = y_rul_r - pred_rul
+        loss_rul = (tf.reduce_sum(pron_mask * tf.where(
+            tf.abs(err) < 0.1,
+            0.5 * tf.square(err),
+            0.1 * (tf.abs(err) - 0.05)))
+            / (tf.reduce_sum(pron_mask) + 1e-8))
+
+        damage = tf.reshape(pred['shared_damage'], [-1])
+        pron_idx = tf.where(pron_mask > 0)[:, 0]
+
+        if tf.size(pron_idx) >= 1:
+            d_p = tf.gather(damage, pron_idx)
+            c_p = tf.gather(cycles, pron_idx)
+            r_p = tf.gather(y_rul_r, pron_idx)
+            w_p = tf.gather(weights, pron_idx)
+            si_p = tf.gather(tf.reshape(seq_idx, [-1]), pron_idx)
+            yhat_p = tf.gather(pred_rul, pron_idx)
+            C_p, m_p = self._gather_seq_params(si_p)
+
+            if tf.size(pron_idx) == 1:
+                d_p = tf.concat([d_p, d_p], 0)
+                yhat_p = tf.concat([yhat_p, yhat_p], 0)
+                c_p = tf.concat([c_p, c_p + 1e-3], 0)
+                r_p = tf.concat([r_p, r_p], 0)
+                w_p = tf.concat([w_p, w_p], 0)
+                C_p = tf.concat([C_p, C_p], 0)
+                m_p = tf.concat([m_p, m_p], 0)
+                si_p = tf.concat([si_p, si_p], 0)
+
+            w_use = w_p if self.config.use_uncertainty_weighting else None
+
+            mono_loss = self.physics.monotonicity_loss(d_p, c_p, w_use)
+            consist_loss = self.physics.consistency_loss(d_p, r_p, w_use)
+            paris_loss = self.physics.paris_law_loss(
+                yhat_p, c_p, C_p, m_p, si_p, w_use)
+        else:
+            mono_loss = tf.constant(0.0)
+            consist_loss = tf.constant(0.0)
+            paris_loss = tf.constant(0.0)
+
+        if is_training and self.cluster_centers is not None:
+            cluster_loss = self.clustering_loss(pred['cluster_embedding'])
+        else:
+            cluster_loss = tf.constant(0.0)
+
+        if self.config.use_dann:
+            cw_mask = tf.equal(dataset, 0)
+            pd_mask = tf.equal(dataset, 1)
+            dom_mask = tf.cast(tf.logical_or(cw_mask, pd_mask), tf.float32)
+            dom_lab = tf.zeros((tf.shape(dataset)[0], 2), tf.float32)
+            dom_lab = tf.where(tf.expand_dims(cw_mask, -1),
+                               tf.constant([[1.0, 0.0]]), dom_lab)
+            dom_lab = tf.where(tf.expand_dims(pd_mask, -1),
+                               tf.constant([[0.0, 1.0]]), dom_lab)
+            domain_loss_raw = tf.reduce_mean(
+                dom_mask * tf.keras.losses.categorical_crossentropy(
+                    dom_lab, pred['domain']))
+            domain_loss = tf.minimum(domain_loss_raw, 5.0)
+            dom_w = 0.1
+        else:
+            domain_loss = tf.constant(0.0)
+            dom_w = 0.0
+
+        total_loss = (
+            self.config.weight_cwru * loss_cwru +
+            self.config.weight_paderborn * loss_pader +
+            self.config.weight_pronostia_rul * loss_rul +
+            lam_mono * mono_loss +
+            lam_paris * paris_loss +
+            lam_consist * consist_loss +
+            self.config.cluster_loss_weight * cluster_loss +
+            dom_w * domain_loss)
+
+        return {
+            'loss': total_loss,
+            'cwru_loss': loss_cwru,
+            'paderborn_loss': loss_pader,
+            'rul_loss': loss_rul,
+            'mono_loss': mono_loss,
+            'paris_loss': paris_loss,
+            'consist_loss': consist_loss,
+            'cluster_loss': cluster_loss,
+            'domain_loss': domain_loss,
+            'lam_mono': tf.cast(lam_mono, tf.float32),
+            'lam_paris': tf.cast(lam_paris, tf.float32),
+            'lam_consist': tf.cast(lam_consist, tf.float32),
+        }
+
+    def _prepare_inputs(self, inputs, outputs, extra):
+        x_in, ews_in, seq_idx = inputs
+        y_cwru = tf.convert_to_tensor(outputs['cwru_class'], tf.float32)
+        y_paderborn = tf.convert_to_tensor(outputs['paderborn_class'], tf.float32)
+        y_rul = tf.convert_to_tensor(outputs['pronostia_rul'], tf.float32)
+        dataset = tf.convert_to_tensor(extra['dataset'], tf.int32)
+        cycles = tf.convert_to_tensor(extra['cycles'], tf.float32)
+        weights = tf.convert_to_tensor(extra['weights'], tf.float32)
+        x_in = tf.cast(x_in, tf.float32)
+        ews_in = tf.cast(ews_in, tf.float32)
+        seq_idx = tf.cast(seq_idx, tf.int32)
+        return x_in, ews_in, seq_idx, y_cwru, y_paderborn, y_rul, dataset, cycles, weights
+
+    @tf.function(reduce_retracing=True)
+    def _train_step_compiled(self, x_in, ews_in, seq_idx, y_cwru,
+                             y_paderborn, y_rul, dataset, cycles, weights,
+                             epoch_tensor):
+        with tf.GradientTape() as tape:
+            m = self._compute_losses(
+                x_in, ews_in, seq_idx, y_cwru, y_paderborn, y_rul,
+                dataset, cycles, weights, epoch_tensor, True)
+            total_loss = m['loss']
+        grads = tape.gradient(total_loss, self.model.trainable_variables)
+        grads = [g if g is not None else tf.zeros_like(v)
+                 for g, v in zip(grads, self.model.trainable_variables)]
+        self.optimizer.apply_gradients(
+            zip(grads, self.model.trainable_variables))
+        return m
+
+    @tf.function(reduce_retracing=True)
+    def _infer_step_compiled(self, x_in, ews_in, seq_idx, y_cwru,
+                             y_paderborn, y_rul, dataset, cycles, weights,
+                             epoch_tensor):
+        return self._compute_losses(
+            x_in, ews_in, seq_idx, y_cwru, y_paderborn, y_rul,
+            dataset, cycles, weights, epoch_tensor, False)
+
+    def train_step(self, inputs, outputs, extra, epoch_tensor,
+                   is_training=True):
+        args = self._prepare_inputs(inputs, outputs, extra)
+        if is_training:
+            return self._train_step_compiled(*args, epoch_tensor)
+        return self._infer_step_compiled(*args, epoch_tensor)
+
+
+# =============================================================
+# §12  DEEP ENSEMBLE + SPLIT-CONFORMAL UQ
+# =============================================================
+
+class DeepEnsembleUQ:
+    def __init__(self, base_config, C_mean, C_std, m_mean, m_std, n_models=5):
+        self.base_config = base_config
+        self.C_mean = C_mean
+        self.C_std = C_std
+        self.m_mean = m_mean
+        self.m_std = m_std
+        self.n_models = n_models
+        self.models = []
+        self.trainers = []
+
+    def _sample_params(self, rng):
+        C_s = np.clip(rng.normal(self.C_mean, self.C_std),
+                      self.base_config.paris_C_bounds[0],
+                      self.base_config.paris_C_bounds[1])
+        m_s = np.clip(rng.normal(self.m_mean, self.m_std),
+                      self.base_config.paris_m_bounds[0],
+                      self.base_config.paris_m_bounds[1])
+        return C_s.astype(np.float32), m_s.astype(np.float32)
+
+    def fit(self, train_gen_factory, val_gen_factory, n_sequences,
+            train_epochs=60):
+        for k in range(self.n_models):
+            seed = self.base_config.random_state + 1000 * k
+            set_reproducible_seed(seed)
+            rng = np.random.RandomState(seed)
+            C_s, m_s = self._sample_params(rng)
+
+            model = build_model_v3(self.base_config, n_sequences)
+            curriculum = PhysicsCurriculum(
+                lambda_max_mono=self.base_config.lambda_max_mono,
+                lambda_max_paris=self.base_config.lambda_max_paris,
+                lambda_max_consist=self.base_config.lambda_max_consist,
+                k=self.base_config.curriculum_k,
+                c0=self.base_config.curriculum_c0)
+            trainer = MultiModalTrainerV3(model, self.base_config, C_s, m_s, curriculum)
+            train_gen = train_gen_factory(seed)
+            val_gen = val_gen_factory(seed)
+            self._train_one(model, trainer, train_gen, val_gen,
+                            epochs=train_epochs)
+            self.models.append(model)
+            self.trainers.append(trainer)
+
+    def _train_one(self, model, trainer, train_gen, val_gen, epochs):
+        best = float('inf')
+        best_w = None
+        patience = 0
+        initial_lr = float(self.base_config.learning_rate)
+        warmup_epochs = 5
+        for ep in range(epochs):
+            if ep < warmup_epochs:
+                new_lr = initial_lr * (ep + 1) / warmup_epochs
+            else:
+                new_lr = initial_lr
+            trainer.optimizer.learning_rate.assign(new_lr)
+            trainer.current_epoch = ep
+
+            ep_tensor = tf.constant(ep, tf.int32)
+            for bi in range(len(train_gen)):
+                inp, out, ext = train_gen[bi]
+                trainer.train_step(inp, out, ext, ep_tensor, is_training=True)
+            vl = []
+            vl_rul = []
+            for bi in range(len(val_gen)):
+                inp, out, ext = val_gen[bi]
+                # [FIX-1] is_training=False → no gradient updates.
+                m = trainer.train_step(inp, out, ext, ep_tensor, is_training=False)
+                vl.append(float(m['loss'].numpy()))
+                if (ext['dataset'] == 2).any():
+                    vl_rul.append(float(m['rul_loss'].numpy()))
+            v = float(np.mean(vl_rul)) if vl_rul else float(np.mean(vl))
+            if v < best:
+                best = v
+                best_w = model.get_weights()
+                patience = 0
+            else:
+                patience += 1
+                if patience >= 10:
+                    break
+        if best_w is not None:
+            model.set_weights(best_w)
+
+    def predict(self, X_vib, X_ews, seq_idx):
+        preds = []
+        for m in self.models:
+            p = m.predict([X_vib, X_ews, seq_idx], verbose=0)
+            preds.append(p['pronostia_rul'].flatten())
+        preds = np.stack(preds, axis=0)
+        return preds.mean(0), preds.std(0), preds
+
+
+class SplitConformalCalibrator:
+    def __init__(self, alpha=0.05):
+        self.alpha = alpha
+        self.q_hat = None
+
+    def calibrate(self, y_true_cal, y_pred_cal):
+        residuals = np.abs(np.asarray(y_true_cal) - np.asarray(y_pred_cal))
+        n = len(residuals)
+        k = int(np.ceil((n + 1) * (1 - self.alpha)))
+        k = min(k, n)
+        self.q_hat = float(np.sort(residuals)[k - 1])
+        return self.q_hat
+
+    def predict_interval(self, y_pred):
+        if self.q_hat is None:
+            raise RuntimeError("Calibrate first.")
+        lo = np.asarray(y_pred) - self.q_hat
+        hi = np.asarray(y_pred) + self.q_hat
+        return lo, hi
+
+    def coverage(self, y_true, y_pred):
+        lo, hi = self.predict_interval(y_pred)
+        return float(np.mean((np.asarray(y_true) >= lo) & (np.asarray(y_true) <= hi)))
+
+
+# =============================================================
+# §13  EVALUATION HELPER
+# =============================================================
+
+def evaluate_v3(model, test_gen, seq_C, seq_m, config=None):
+    all_x, all_ews, all_seq = [], [], []
+    all_out = {'pronostia_rul': [], 'cwru_class': [], 'paderborn_class': []}
+    all_extra = {'dataset': [], 'cycles': []}
+    for i in range(len(test_gen)):
+        inputs, outputs, extra = test_gen[i]
+        all_x.append(inputs[0])
+        all_ews.append(inputs[1])
+        all_seq.append(inputs[2])
+        for k in all_out:
+            if k in outputs:
+                all_out[k].append(outputs[k])
+        all_extra['dataset'].append(extra['dataset'])
+        all_extra['cycles'].append(extra['cycles'])
+    all_x = np.vstack(all_x)
+    all_ews = np.vstack(all_ews)
+    all_seq = np.vstack(all_seq)
+    for k in all_out:
+        arrs = all_out[k]
+        arrs = [a.reshape(-1, 1) if a.ndim == 1 else a for a in arrs]
+        all_out[k] = np.vstack(arrs)
+    all_extra['dataset'] = np.concatenate(all_extra['dataset'])
+    all_extra['cycles'] = np.concatenate(all_extra['cycles'])
+
+    pred = model.predict([all_x, all_ews, all_seq], verbose=0)
+    y_rul_true = all_out['pronostia_rul'].flatten()
+    y_rul_pred = pred['pronostia_rul'].flatten()
+    pron_mask = all_extra['dataset'] == 2
+
+    y_t = y_rul_true[pron_mask]
+    y_p = y_rul_pred[pron_mask]
+    rmse = float(np.sqrt(mean_squared_error(y_t, y_p)))
+    mae = float(mean_absolute_error(y_t, y_p))
+
+    cycles = all_extra['cycles'][pron_mask]
+    seq_ids = all_seq.flatten()[pron_mask]
+    y_rul_pred_pron = y_rul_pred[pron_mask]
+
+    C_flat = np.asarray(seq_C, dtype=np.float64).reshape(-1)
+    m_flat = np.asarray(seq_m, dtype=np.float64).reshape(-1)
+    C_per_sample = C_flat[seq_ids.astype(int)]
+    m_per_sample = m_flat[seq_ids.astype(int)]
+
+    per_seq_rul = defaultdict(list)
+    per_seq_cycles = defaultdict(list)
+    per_seq_C = defaultdict(list)
+    per_seq_m = defaultdict(list)
+    for rp, c, Cv, mv, s in zip(y_rul_pred_pron, cycles,
+                                C_per_sample, m_per_sample, seq_ids):
+        per_seq_rul[str(s)].append(rp)
+        per_seq_cycles[str(s)].append(c)
+        per_seq_C[str(s)].append(Cv)
+        per_seq_m[str(s)].append(mv)
+    per_seq_rul = {k: np.array(v) for k, v in per_seq_rul.items()}
+    per_seq_cycles = {k: np.array(v) for k, v in per_seq_cycles.items()}
+    per_seq_C = {k: np.array(v) for k, v in per_seq_C.items()}
+    per_seq_m = {k: np.array(v) for k, v in per_seq_m.items()}
+
+    phy = PHYMetric()
+    phy_out = phy.compute_dataset(per_seq_rul, per_seq_cycles,
+                                  per_seq_C, per_seq_m)
+
+    refit_phys = {}
+    for k in per_seq_rul:
+        refit_phys[k] = phy.compute_sequence_refit(
+            per_seq_rul[k], per_seq_cycles[k])
+    refit_vals = np.array([refit_phys[k]['phy_refit'] for k in refit_phys
+                           if not np.isnan(refit_phys[k]['phy_refit'])])
+    phy_refit_macro = float(np.mean(refit_vals)) if len(refit_vals) else float('nan')
+
+    return {'pronostia_rmse': rmse,
+            'pronostia_mae': mae,
+            'phy_macro': phy_out['macro_phy'],
+            'phy_per_sequence': phy_out['per_sequence'],
+            'phy_refit_macro': phy_refit_macro,
+            'phy_refit_per_sequence': refit_phys}
+
+
+# =============================================================
+# §14  DATA GENERATOR V3
+# =============================================================
+
+class MultiModalDataGeneratorV3(tf.keras.utils.Sequence):
+    def __init__(self, cwru_data, paderborn_data, pronostia_data,
+                 batch_size=32, shuffle=True, config=None):
+        self.cwru_data = cwru_data
+        self.paderborn_data = paderborn_data
+        self.pronostia_data = pronostia_data
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.config = config
+        self.rng = np.random.RandomState(config.random_state if config else 42)
+        self.indices = []
+
+        if cwru_data is not None and len(cwru_data[0]) > 0:
+            print(f"  ✅ Adding CWRU: {len(cwru_data[0])} samples")
+            for i in range(len(cwru_data[0])):
+                self.indices.append((0, i))
+        if paderborn_data is not None and len(paderborn_data[0]) > 0:
+            print(f"  ✅ Adding Paderborn: {len(paderborn_data[0])} samples")
+            for i in range(len(paderborn_data[0])):
+                self.indices.append((1, i))
+        if pronostia_data is not None and len(pronostia_data[0]) > 0:
+            print(f"  ✅ Adding Pronostia: {len(pronostia_data[0])} samples")
+            for i in range(len(pronostia_data[0])):
+                self.indices.append((2, i))
+
+        print(f"  Total samples: {len(self.indices)}")
+        self.on_epoch_end()
+
+    def __len__(self):
+        return (len(self.indices) + self.batch_size - 1) // self.batch_size
+
+    def __getitem__(self, idx):
+        start = idx * self.batch_size
+        end = min(start + self.batch_size, len(self.indices))
+        batch_indices = self.indices[start:end]
+        b = len(batch_indices)
+
+        cwru_arr = np.zeros((b, 4), dtype=np.float32)
+        pader_arr = np.zeros((b, 3), dtype=np.float32)
+        rul_arr = np.zeros((b,), dtype=np.float32)
+        dataset_arr = np.zeros((b,), dtype=np.int32)
+        domain_arr = np.zeros((b,), dtype=np.int32)
+        cycles_arr = np.zeros((b,), dtype=np.float32)
+        seq_arr = np.zeros((b, 1), dtype=np.int32)
+        weights_arr = np.ones((b,), dtype=np.float32)
+
+        input_list = [None] * b
+        ews_list = [None] * b
+
+        for i, (ds_id, sample_idx) in enumerate(batch_indices):
+            if ds_id == 0:  # CWRU
+                X_vib, X_ews, y_class, _, _ = self.cwru_data
+                x = X_vib[sample_idx]
+                padded = np.zeros((x.shape[0], 4), dtype=np.float32)
+                padded[:, :3] = x
+                input_list[i] = padded
+                ews_list[i] = X_ews[sample_idx]
+                cwru_arr[i] = y_class[sample_idx].astype(np.float32)
+                dataset_arr[i] = 0
+                domain_arr[i] = 0
+                seq_arr[i] = 0
+
+            elif ds_id == 1:  # Paderborn
+                X_vib, X_ews, y_class, _, _ = self.paderborn_data
+                input_list[i] = X_vib[sample_idx]
+                ews_list[i] = X_ews[sample_idx]
+                pader_arr[i] = y_class[sample_idx].astype(np.float32)
+                dataset_arr[i] = 1
+                domain_arr[i] = 1
+                seq_arr[i] = 0
+
+            else:  # Pronostia
+                X_vib, X_ews, y_rul, _, seq_ids, temporal_pos, weights = self.pronostia_data
+                x = X_vib[sample_idx]
+                padded = np.zeros((x.shape[0], 4), dtype=np.float32)
+                padded[:, :2] = x
+                input_list[i] = padded
+                ews_list[i] = X_ews[sample_idx]
+                rul_arr[i] = float(y_rul[sample_idx])
+                dataset_arr[i] = 2
+                domain_arr[i] = 2
+                cycles_arr[i] = temporal_pos[sample_idx]
+                seq_arr[i] = int(seq_ids[sample_idx])
+                weights_arr[i] = float(weights[sample_idx])
+
+        input_array = np.stack(input_list, axis=0)
+        ews_array = np.array(ews_list, dtype=np.float32)
+
+        return ([input_array, ews_array, seq_arr],
+                {'cwru_class': cwru_arr,
+                 'paderborn_class': pader_arr,
+                 'pronostia_rul': rul_arr,
+                 'shared_damage': np.zeros((b, 1), dtype=np.float32)},
+                {'dataset': dataset_arr,
+                 'domain': domain_arr,
+                 'cycles': cycles_arr,
+                 'weights': weights_arr})
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.rng.shuffle(self.indices)
+
+
+# =============================================================
+# §15  TRAINING LOOP
+# =============================================================
+
+def train_single_model_v3(config, train_gen, val_gen, trainer,
+                          epochs=None, early_stop_patience=15):
+    if epochs is None:
+        epochs = config.epochs
+    best_loss = float('inf')
+    best_weights = None
+    patience = 0
+    history = {'loss': [], 'val_loss': []}
+    initial_lr = float(config.learning_rate)
+    warmup_epochs = 5
+
+    print(f"    [train] epochs={epochs}, batches/epoch={len(train_gen)}, "
+          f"batch_size={config.batch_size}", flush=True)
+
+    import time as _time
+
+    for ep in range(epochs):
+        if ep < warmup_epochs:
+            new_lr = initial_lr * (ep + 1) / warmup_epochs
+        else:
+            new_lr = initial_lr
+        trainer.optimizer.learning_rate.assign(new_lr)
+
+        trainer.current_epoch = ep
+
+        # --- train ---
+        batch_metrics = []
+        ep_losses = []
+        t_ep_start = _time.time()
+        ep_tensor = tf.constant(ep, tf.int32)
+        for bi in range(len(train_gen)):
+            if bi == 0 or bi % 50 == 0:
+                elapsed = _time.time() - t_ep_start
+                print(f"      [ep {ep+1:>3}] batch {bi:>4}/{len(train_gen)}  "
+                      f"elapsed={elapsed:.1f}s", flush=True)
+            inp, out, ext = train_gen[bi]
+            m = trainer.train_step(inp, out, ext, ep_tensor, is_training=True)
+            batch_metrics.append(m)
+            ep_losses.append(float(m['loss'].numpy()))
+        avg_tr = float(np.mean(ep_losses))
+        t_train = _time.time() - t_ep_start
+
+        if ep == 0:
+            cwru_l = np.mean([float(m['cwru_loss'].numpy()) for m in batch_metrics])
+            pad_l = np.mean([float(m['paderborn_loss'].numpy()) for m in batch_metrics])
+            rul_l = np.mean([float(m['rul_loss'].numpy()) for m in batch_metrics])
+            phys_l = np.mean([
+                float((m['mono_loss'] + m['paris_loss'] + m['consist_loss']).numpy())
+                for m in batch_metrics])
+            print(f"  [Loss balance e0] cwru={cwru_l:.4f} pader={pad_l:.4f} "
+                  f"rul={rul_l:.4f} phys={phys_l:.6f}", flush=True)
+
+        # --- val (no gradient updates) ---
+        t_val_start = _time.time()
+        vl = []
+        vl_rul = []
+        for bi in range(len(val_gen)):
+            inp, out, ext = val_gen[bi]
+            # [FIX-1] is_training=False
+            m = trainer.train_step(inp, out, ext, ep_tensor, is_training=False)
+            vl.append(float(m['loss'].numpy()))
+            if (ext['dataset'] == 2).any():
+                vl_rul.append(float(m['rul_loss'].numpy()))
+        avg_vl = float(np.mean(vl))
+        avg_vl_rul = float(np.mean(vl_rul)) if vl_rul else avg_vl
+        t_val = _time.time() - t_val_start
+
+        history['loss'].append(avg_tr)
+        history['val_loss'].append(avg_vl)
+
+        if avg_vl_rul < best_loss:
+            best_loss = avg_vl_rul
+            best_weights = trainer.model.get_weights()
+            patience = 0
+            flag = "✓"
+        else:
+            patience += 1
+            flag = " "
+
+        print(f"    epoch {ep+1:>3}/{epochs}  "
+              f"train={avg_tr:.4f}  val={avg_vl:.4f}  "
+              f"val_rul={avg_vl_rul:.4f}  {flag}  "
+              f"[{t_train:.0f}s train + {t_val:.0f}s val]", flush=True)
+
+        if patience >= early_stop_patience and ep > 30:
+            print(f"    early stop at epoch {ep+1}", flush=True)
+            break
+
+    if best_weights is not None:
+        trainer.model.set_weights(best_weights)
+    return trainer.model, history, best_loss
+
+
+# =============================================================
+# §16  VISUALIZATION
+# =============================================================
+
+class TheoreticalVisualizer:
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        plt.rcParams.update({'font.size': 11, 'font.family': 'sans-serif',
+                             'figure.dpi': 300, 'savefig.dpi': 300,
+                             'savefig.bbox': 'tight', 'pdf.fonttype': 42})
+
+    def plot_gpr_fits(self, gpr_results, output_name='gpr_fits.pdf'):
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        for b, r in gpr_results.items():
+            axes[0].plot(r['temporal'], r['y_smooth'], label=b, linewidth=1.5)
+            axes[1].plot(r['temporal'], r['dy_dt'], label=b, linewidth=1.5)
+        axes[0].set_xlabel('Temporal position')
+        axes[0].set_ylabel('Smoothed RUL')
+        axes[0].set_title('GPR-smoothed degradation trajectories')
+        axes[1].set_xlabel('Temporal position')
+        axes[1].set_ylabel('dRUL/dt')
+        axes[1].set_title('GPR-smoothed degradation rates')
+        axes[0].grid(alpha=0.3)
+        axes[1].grid(alpha=0.3)
+        axes[0].legend(fontsize=8, ncol=2)
+        axes[1].legend(fontsize=8, ncol=2)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, output_name))
+        plt.close()
+
+    def plot_C_m_scatter(self, C_map, m_map, output_name='Cm_scatter.pdf'):
+        fig, ax = plt.subplots(figsize=(7, 5))
+        for b in C_map:
+            ax.scatter(C_map[b], m_map[b], s=60, alpha=0.8)
+            ax.annotate(b, (C_map[b], m_map[b]), fontsize=8,
+                        xytext=(4, 4), textcoords='offset points')
+        ax.set_xscale('log')
+        ax.set_xlabel('C (log scale)')
+        ax.set_ylabel('m')
+        ax.set_title('Per-sequence Paris-law parameters')
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, output_name))
+        plt.close()
+
+    def plot_phy_vs_rmse(self, phy_vals, rmse_vals, labels,
+                         output_name='phy_vs_rmse.pdf'):
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.scatter(phy_vals, rmse_vals, s=60)
+        for x, y, lab in zip(phy_vals, rmse_vals, labels):
+            ax.annotate(lab, (x, y), fontsize=8,
+                        xytext=(4, 4), textcoords='offset points')
+        rho, p = spearmanr(phy_vals, rmse_vals)
+        ax.set_xlabel('PHY (lower is better)')
+        ax.set_ylabel('RMSE (lower is better)')
+        ax.set_title(f'PHY vs RMSE (Spearman rho = {rho:.2f}, p = {p:.3f})')
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, output_name))
+        plt.close()
+
+    def plot_curriculum(self, epochs, curriculum, output_name='curriculum.pdf'):
+        ep = np.arange(epochs)
+        lam_m = [curriculum.at(int(e))['mono'] for e in ep]
+        lam_p = [curriculum.at(int(e))['paris'] for e in ep]
+        lam_c = [curriculum.at(int(e))['consist'] for e in ep]
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(ep, lam_m, label='lambda_mono')
+        ax.plot(ep, lam_p, label='lambda_paris')
+        ax.plot(ep, lam_c, label='lambda_consist')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('lambda')
+        ax.set_title('Sigmoid physics curriculum')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, output_name))
+        plt.close()
+
+    def plot_reliability(self, alphas, empirical,
+                         output_name='reliability_conformal.pdf'):
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.plot([0, 1], [0, 1], 'r--', label='Ideal')
+        ax.plot([1 - a for a in alphas], empirical, 'o-', label='Empirical')
+        ax.set_xlabel('Target coverage')
+        ax.set_ylabel('Empirical coverage')
+        ax.set_title('Conformal reliability diagram')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, output_name))
+        plt.close()
+
+
+# =============================================================
+# §17  MAIN
+# =============================================================
+
+def main_v3():
+    set_reproducible_seed(CURRENT_SEED)
+    config = ConfigV3()
+    config.random_state = CURRENT_SEED
+
+    print(f"\n{'=' * 80}")
+    print(f"MT-SUPINN v3 — Theoretical Paper | Seed {CURRENT_SEED}")
+    print(f"{'=' * 80}")
+
+    gpus = tf.config.list_physical_devices('GPU')
+    print(f"GPU: {len(gpus)} device(s)")
+    for g in gpus:
+        print(f"  - {g}")
+
+    all_results = {'seed': CURRENT_SEED, 'config': config.__dict__.copy()}
+
+    # §A Load datasets
+    print("\n" + "=" * 80)
+    print("§A  LOADING DATASETS")
+    print("=" * 80)
+
+    print("\n[A.1] CWRU")
+    cwru_loader = CWRULoader(config.cwru_path, config)
+    X_c_vib, X_c_ews, y_c_class, y_c_sev, c_files = cwru_loader.load()
+    print(f"  → {len(X_c_vib)} windows")
+
+    cwru_class_names = ['Normal', 'Ball', 'InnerRace', 'OuterRace']
+    cwru_label_map = {n: i for i, n in enumerate(cwru_class_names)}
+    le_cwru = LabelEncoder().fit(cwru_class_names)
+    le_cwru.classes_ = np.array(cwru_class_names)
+
+    def _map_cwru_label(label):
+        s = label.lower()
+        if 'normal' in s: return cwru_label_map['Normal']
+        if 'ball' in s: return cwru_label_map['Ball']
+        if 'inner' in s or 'ir' in s: return cwru_label_map['InnerRace']
+        if 'outer' in s or 'or' in s: return cwru_label_map['OuterRace']
+        return 0
+
+    y_c_int = np.array([_map_cwru_label(l) for l in y_c_class]) if len(X_c_vib) else np.array([])
+    y_c_onehot = tf.keras.utils.to_categorical(y_c_int, 4) if len(X_c_vib) else np.array([])
+
+    print("\n[A.2] Paderborn")
+    pader_loader = PaderbornMultimodalLoader(config.paderborn_path, config)
+    X_p_vib, X_p_ews, y_p_class, y_p_sev, p_files, _ = \
+        pader_loader.load_balanced_subset(total_files=150)
+    print(f"  → {len(X_p_vib)} windows")
+
+    pader_class_names = ['Normal', 'InnerRace', 'OuterRace']
+    pader_label_map = {n: i for i, n in enumerate(pader_class_names)}
+    le_pader = LabelEncoder().fit(pader_class_names)
+    le_pader.classes_ = np.array(pader_class_names)
+    y_p_onehot = (tf.keras.utils.to_categorical(le_pader.transform(y_p_class), 3)
+                  if len(X_p_vib) else np.array([]))
+
+    print("\n[A.3] Pronostia")
+    prono_loader = PronostiaLoader(config.pronostia_path, config)
+
+    X_pr_vib, X_pr_ews, y_pr_rul, _, pr_bearings, pr_temporal = \
+        prono_loader.load_train_data(max_windows=10000, use_learning_set=True)
+    print(f"  Train pool: {len(X_pr_vib)} windows, "
+          f"{len(np.unique(pr_bearings))} bearings")
+
+    X_pr_test_vib, X_pr_test_ews, y_pr_test_rul, _, \
+        pr_test_bearings, pr_test_temporal = \
+        prono_loader.load_train_data(max_windows=5000, use_learning_set=False)
+    print(f"  Test pool:  {len(X_pr_test_vib)} windows, "
+          f"{len(np.unique(pr_test_bearings))} bearings")
+
+    overlap = set(np.unique(pr_bearings)) & set(np.unique(pr_test_bearings))
+    assert len(overlap) == 0, f"Pronostia leakage: {sorted(overlap)}"
+
+    # §A.4 Splits
+    print("\n[A.4] Splits")
+
+    c_train_idx, c_val_idx, c_test_idx = [], [], []
+    if len(X_c_vib) > 0:
+        unique_files = sorted(set(c_files))
+
+        def _cwru_file_label(fp):
+            s = fp.lower()
+            if 'normal' in s: return cwru_label_map['Normal']
+            if 'ball' in s: return cwru_label_map['Ball']
+            if 'inner' in s or 'ir' in s: return cwru_label_map['InnerRace']
+            if 'outer' in s or 'or' in s: return cwru_label_map['OuterRace']
+            return -1
+
+        file_labels = [_cwru_file_label(f) for f in unique_files]
+        valid = [i for i, l in enumerate(file_labels) if l != -1]
+        unique_files = [unique_files[i] for i in valid]
+        file_labels = [file_labels[i] for i in valid]
+
+        tv_files, te_files = train_test_split(
+            unique_files, test_size=0.2,
+            random_state=CURRENT_SEED, stratify=file_labels)
+        tv_labels = [file_labels[unique_files.index(f)] for f in tv_files]
+        tr_files, va_files = train_test_split(
+            tv_files, test_size=0.25,
+            random_state=CURRENT_SEED, stratify=tv_labels)
+
+        def _idx(file_list):
+            return [i for i, f in enumerate(c_files) if f in file_list]
+
+        c_train_idx = _idx(tr_files)
+        c_val_idx = _idx(va_files)
+        c_test_idx = _idx(te_files)
+        print(f"  CWRU: train={len(c_train_idx)}, val={len(c_val_idx)}, "
+              f"test={len(c_test_idx)}")
+
+    p_train_idx, p_val_idx, p_test_idx = [], [], []
+    if len(X_p_vib) > 0 and len(p_files) > 0:
+        # [FIX-2] label via parent folder, not full path.
+        def _pader_file_label(fp):
+            cls, _ = _paderborn_label_from_path(fp)
+            return pader_label_map[cls]
+
+        unique_p_files = sorted(set(p_files))
+        file_labels = [_pader_file_label(f) for f in unique_p_files]
+
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2,
+                                     random_state=CURRENT_SEED)
+        tv, te = next(sss.split(unique_p_files, file_labels))
+        tv_files = [unique_p_files[i] for i in tv]
+        te_files = [unique_p_files[i] for i in te]
+        tv_labels = [file_labels[i] for i in tv]
+
+        sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.25,
+                                      random_state=CURRENT_SEED)
+        tr, va = next(sss2.split(tv_files, tv_labels))
+        tr_files = [tv_files[i] for i in tr]
+        va_files = [tv_files[i] for i in va]
+
+        def _pidx(file_list):
+            return [i for i, f in enumerate(p_files) if f in file_list]
+
+        p_train_idx = _pidx(tr_files)
+        p_val_idx = _pidx(va_files)
+        p_test_idx = _pidx(te_files)
+        print(f"  Paderborn: train={len(p_train_idx)}, val={len(p_val_idx)}, "
+              f"test={len(p_test_idx)}")
+
+    FIXED_TRAIN_BEARINGS = ['Bearing1_1', 'Bearing1_2', 'Bearing3_2']
+    FIXED_VAL_BEARINGS = ['Bearing2_1']
+    FIXED_TEST_BEARINGS = ['Bearing3_1', 'Bearing2_2']
+    all_needed = FIXED_TRAIN_BEARINGS + FIXED_VAL_BEARINGS + FIXED_TEST_BEARINGS
+    available = set(np.unique(pr_bearings).tolist())
+    missing = [b for b in all_needed if b not in available]
+    assert not missing, f"Missing required bearings: {missing}"
+
+    tr_mask = np.isin(pr_bearings, FIXED_TRAIN_BEARINGS)
+    va_mask = np.isin(pr_bearings, FIXED_VAL_BEARINGS)
+    te_mask = np.isin(pr_bearings, FIXED_TEST_BEARINGS)
+    pr_train_idx = np.where(tr_mask)[0]
+    pr_val_idx = np.where(va_mask)[0]
+    pr_test_idx = np.where(te_mask)[0]
+    print(f"  Pronostia: train={len(pr_train_idx)} "
+          f"({FIXED_TRAIN_BEARINGS}), val={len(pr_val_idx)} "
+          f"({FIXED_VAL_BEARINGS}), test={len(pr_test_idx)} "
+          f"({FIXED_TEST_BEARINGS})")
+
+    # §A.5 Paderborn augmentation
+    if config.use_data_augmentation and len(p_train_idx) > 0:
+        print("\n[A.5] Augmenting Paderborn TRAIN only")
+        Xpt = X_p_vib[p_train_idx]
+        Ept = X_p_ews[p_train_idx]
+        Cpt = y_p_class[p_train_idx]
+        Spt = y_p_sev[p_train_idx]
+        Xa, Ea, Ca, Sa = augment_paderborn_data(Xpt, Ept, Cpt, Spt,
+                                                augmentation_factor=1)
+        n_new = len(Xa) - len(Xpt)
+        X_p_vib = np.vstack([X_p_vib, Xa[len(Xpt):]])
+        X_p_ews = np.vstack([X_p_ews, Ea[len(Xpt):]])
+        y_p_class = np.concatenate([y_p_class, Ca[len(Xpt):]])
+        y_p_sev = np.concatenate([y_p_sev, Sa[len(Xpt):]])
+        p_files = p_files + [f"aug_{i}" for i in range(n_new)]
+        p_train_idx = list(p_train_idx) + list(
+            range(len(X_p_vib) - n_new, len(X_p_vib)))
+        y_p_onehot = tf.keras.utils.to_categorical(
+            le_pader.transform(y_p_class), 3)
+        print(f"  Paderborn augmented: {len(Xpt)} → {len(p_train_idx)}")
+
+    # §A.6 EWS scaling
+    print("\n[A.6] Fitting EWS scaler on TRAIN")
+    train_pool = []
+    if len(c_train_idx): train_pool.append(X_c_ews[c_train_idx])
+    if len(p_train_idx): train_pool.append(X_p_ews[p_train_idx])
+    if len(pr_train_idx): train_pool.append(X_pr_ews[pr_train_idx])
+    scaler = StandardScaler().fit(np.vstack(train_pool))
+    joblib.dump(scaler, os.path.join(config.output_dir, 'ews_scaler.pkl'))
+
+    X_c_ews_train = scaler.transform(X_c_ews[c_train_idx]) if len(c_train_idx) else np.array([])
+    X_c_ews_val = scaler.transform(X_c_ews[c_val_idx]) if len(c_val_idx) else np.array([])
+    X_c_ews_test = scaler.transform(X_c_ews[c_test_idx]) if len(c_test_idx) else np.array([])
+
+    X_p_ews_train = scaler.transform(X_p_ews[p_train_idx]) if len(p_train_idx) else np.array([])
+    X_p_ews_val = scaler.transform(X_p_ews[p_val_idx]) if len(p_val_idx) else np.array([])
+    X_p_ews_test = scaler.transform(X_p_ews[p_test_idx]) if len(p_test_idx) else np.array([])
+
+    X_pr_ews_train = scaler.transform(X_pr_ews[pr_train_idx]) if len(pr_train_idx) else np.array([])
+    X_pr_ews_val = scaler.transform(X_pr_ews[pr_val_idx]) if len(pr_val_idx) else np.array([])
+    X_pr_ews_test = scaler.transform(X_pr_ews[pr_test_idx]) if len(pr_test_idx) else np.array([])
+
+    X_pr_test_ews_scaled = scaler.transform(X_pr_test_ews)
+    print(f"  Scaler fitted. Test-pool EWS scaled: {X_pr_test_ews_scaled.shape}")
+
+    # §B Per-sequence dataset
+    print("\n" + "=" * 80)
+    print("§B  PER-SEQUENCE PRONOSTIA DATASET")
+    print("=" * 80)
+
+    per_seq_train = PerSequenceDataset(
+        X_vib=X_pr_vib[pr_train_idx], X_ews=X_pr_ews_train,
+        y_rul=y_pr_rul[pr_train_idx], bearings=pr_bearings[pr_train_idx],
+        temporal=pr_temporal[pr_train_idx], window_size=config.window_size)
+    print(f"  Training sequences: {per_seq_train.bearings()}")
+
+    per_seq_val = PerSequenceDataset(
+        X_vib=X_pr_vib[pr_val_idx], X_ews=X_pr_ews_val,
+        y_rul=y_pr_rul[pr_val_idx], bearings=pr_bearings[pr_val_idx],
+        temporal=pr_temporal[pr_val_idx], window_size=config.window_size)
+    print(f"  Val sequences:      {per_seq_val.bearings()}")
+
+        # §C Analytic (C, m) from per-bearing α  [Option A+C]
+    print("\n" + "=" * 80)
+    print("§C  ANALYTIC PHYSICS PARAMETERS FROM PER-BEARING α")
+    print("=" * 80)
+
+    # No LSQ. For y(τ) = 1 − τ^α, the induced Paris law is exact:
+    #     C = α,   m = (α − 1) / α.
+    # GPR is still instantiated for the uncertainty weights below.
+    gpr = GPRRateEstimator(
+        kernel_type=config.gpr_kernel,
+        length_scale=config.gpr_length_scale,
+        noise=config.gpr_noise,
+        n_restarts=config.gpr_n_restarts,
+        normalize_y=config.gpr_normalize_y)
+
+    alpha_map = getattr(prono_loader, '_alpha_map', {})
+    C_m_map = {}
+    _seen = set()
+    for _pds in (per_seq_train, per_seq_val):
+        for b in _pds.bearings():
+            if b in _seen:
+                continue
+            _seen.add(b)
+            _seq = _pds.get(b)
+            _alpha = float(alpha_map.get(b, config.rul_alpha))
+            C_m_map[b] = {
+                'C': _alpha,
+                'm': (_alpha - 1.0) / _alpha,
+                'alpha': _alpha,
+                'method': 'analytic_from_alpha',
+                'n_points': int(_seq['n']),
+            }
+    print("\n  Estimated per-sequence Paris parameters (investigation only):")
+    print(f"  {'Bearing':<14} {'C':>12} {'m':>8} {'method':>18} {'n_pts':>6}")
+    for b, r in C_m_map.items():
+        print(f"  {b:<14} {r['C']:>12.3e} {r['m']:>8.3f} "
+              f"{r['method']:>18} {r['n_points']:>6}")
+
+    with open(os.path.join(config.output_dir, 'Cm_map_investigation.json'), 'w') as f:
+        json.dump({k: {kk: (float(vv) if isinstance(vv, (int, float, np.floating))
+                            else vv)
+                       for kk, vv in v.items()}
+                   for k, v in C_m_map.items()}, f, indent=2)
+
+        # [Option A+C] No LSQ, so no bound saturation by construction.
+    # Report the analytic (α, C, m) triples instead of bound distances.
+    print("\n  [Paris diagnostic] analytic (α, C, m) per bearing:")
+    for b, r in C_m_map.items():
+        print(f"    {b:<14} α={r['alpha']:.3f}  "
+              f"C={r['C']:.3f}  m={r['m']:.3f}")
+    _alphas = np.array([r['alpha'] for r in C_m_map.values()])
+    _ms = np.array([r['m'] for r in C_m_map.values()])
+    print(f"\n  [Paris diagnostic] α range "
+          f"[{_alphas.min():.3f}, {_alphas.max():.3f}] "
+          f"std={_alphas.std():.3f};  "
+          f"m range [{_ms.min():.3f}, {_ms.max():.3f}] "
+          f"std={_ms.std():.3f}")
+
+   
+
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for b in per_seq_train.bearings():
+        seq = per_seq_train.get(b)
+        t = seq['temporal']
+        d = 1.0 - seq['rul']
+        ax.plot(t, d, label=b)
+    ax.set_xlabel('Normalized time')
+    ax.set_ylabel('Damage = 1 - RUL')
+    ax.set_title('Observed damage trajectories (training bearings)')
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(config.output_dir, 'damage_trajectories.pdf'))
+    plt.close()
+    print(f"  ✓ damage_trajectories.pdf saved")
+
+    train_bearings = per_seq_train.bearings()
+    val_bearings = per_seq_val.bearings()
+    heldout_bearings = sorted(set(pr_bearings[pr_test_idx].tolist()))
+    unseen_bearings = sorted(set(pr_test_bearings.tolist()))
+
+    all_bearings = sorted(set(train_bearings) | set(val_bearings)
+                          | set(heldout_bearings) | set(unseen_bearings))
+    bearing_to_seq = {b: i for i, b in enumerate(all_bearings)}
+    print(f"\n  Sequence indices ({len(bearing_to_seq)} bearings): {bearing_to_seq}")
+
+    C_train_vals = np.array([C_m_map[b]['C'] for b in train_bearings])
+    m_train_vals = np.array([C_m_map[b]['m'] for b in train_bearings])
+    C_median = float(np.median(C_train_vals))
+    m_median = float(np.median(m_train_vals))
+
+    C_table = np.zeros(len(all_bearings), dtype=np.float32)
+    m_table = np.zeros(len(all_bearings), dtype=np.float32)
+    # [Path 2] Same as run_stage_1: per-bearing α for every loaded bearing.
+    _n_adaptive = 0
+    for b, i in bearing_to_seq.items():
+        if b in C_m_map:
+            C_table[i] = C_m_map[b]['C']
+            m_table[i] = C_m_map[b]['m']
+            _n_adaptive += 1
+        elif b in alpha_map:
+            _a = float(alpha_map[b])
+            C_table[i] = _a
+            m_table[i] = (_a - 1.0) / _a
+            _n_adaptive += 1
+        else:
+            C_table[i] = C_median
+            m_table[i] = m_median
+    print(f"  [Path 2] adaptive (C, m) set for {_n_adaptive}/"
+          f"{len(all_bearings)} bearings; median fallback for the rest.")
+
+    print(f"  Training median: C={C_median:.3e}, m={m_median:.3f}")
+
+    seq_ids_train = np.array([bearing_to_seq[b] for b in pr_bearings[pr_train_idx]],
+                             dtype=np.int32)
+    seq_ids_val = np.array([bearing_to_seq[b] for b in pr_bearings[pr_val_idx]],
+                           dtype=np.int32)
+    seq_ids_test = np.array(
+        [bearing_to_seq[b] for b in pr_bearings[pr_test_idx]],
+        dtype=np.int32)
+    seq_ids_testpool = np.array(
+        [bearing_to_seq[b] for b in pr_test_bearings],
+        dtype=np.int32)
+
+    assert len(seq_ids_test) == len(pr_test_idx)
+    assert len(seq_ids_testpool) == len(pr_test_bearings)
+    print(f"  ✓ seq_ids_test: {len(seq_ids_test)}, "
+          f"seq_ids_testpool: {len(seq_ids_testpool)}")
+
+    train_weights_list = []
+    for b in train_bearings:
+        seq = per_seq_train.get(b)
+        gpr_out = gpr.fit_sequence(seq)
+        s2 = gpr_out['sigma2']
+        s2 = np.where(np.isnan(s2), np.nanmedian(s2), s2)
+        w = 1.0 / (s2 + config.sigma_eps)
+        w = w / (np.mean(w) + 1e-12)
+        w = np.clip(w, 0.0, 100.0)
+        train_weights_list.append(w)
+
+    weights_train = np.zeros(len(pr_train_idx), dtype=np.float32)
+    pr_train_bearings = pr_bearings[pr_train_idx]
+    pr_train_temporal = pr_temporal[pr_train_idx]
+
+    assigned = np.zeros(len(pr_train_idx), dtype=bool)
+    for b, w_b in zip(train_bearings, train_weights_list):
+        mask_b = pr_train_bearings == b
+        idx_b = np.where(mask_b)[0]
+        order = np.argsort(pr_train_temporal[idx_b])
+        sorted_idx_b = idx_b[order]
+        weights_train[sorted_idx_b] = w_b[:len(sorted_idx_b)]
+        assigned[sorted_idx_b] = True
+    assert assigned.all(), \
+        f"Unassigned training weights at indices: {np.where(~assigned)[0][:10]}"
+    print(f"  weights_train: min={weights_train.min():.4f}, "
+          f"max={weights_train.max():.4f}, mean={weights_train.mean():.4f}")
+
+    weights_val = np.ones(len(pr_val_idx), dtype=np.float32)
+    weights_test = np.ones(len(pr_test_idx), dtype=np.float32)
+
+    # §D Build generators
+    print("\n" + "=" * 80)
+    print("§D  BUILDING GENERATORS")
+    print("=" * 80)
+
+    prono_train = (X_pr_vib[pr_train_idx], X_pr_ews_train,
+                   y_pr_rul[pr_train_idx], pr_bearings[pr_train_idx],
+                   seq_ids_train, pr_temporal[pr_train_idx], weights_train) \
+        if len(pr_train_idx) else None
+    prono_val = (X_pr_vib[pr_val_idx], X_pr_ews_val,
+                 y_pr_rul[pr_val_idx], pr_bearings[pr_val_idx],
+                 seq_ids_val, pr_temporal[pr_val_idx], weights_val) \
+        if len(pr_val_idx) else None
+    prono_test = (X_pr_vib[pr_test_idx], X_pr_ews_test,
+                  y_pr_rul[pr_test_idx], pr_bearings[pr_test_idx],
+                  seq_ids_test, pr_temporal[pr_test_idx], weights_test) \
+        if len(pr_test_idx) else None
+
+    cwru_train = (X_c_vib[c_train_idx], X_c_ews_train,
+                  y_c_onehot[c_train_idx], y_c_sev[c_train_idx], None) \
+        if len(c_train_idx) else None
+    cwru_val = (X_c_vib[c_val_idx], X_c_ews_val,
+                y_c_onehot[c_val_idx], y_c_sev[c_val_idx], None) \
+        if len(c_val_idx) else None
+    cwru_test = (X_c_vib[c_test_idx], X_c_ews_test,
+                 y_c_onehot[c_test_idx], y_c_sev[c_test_idx], None) \
+        if len(c_test_idx) else None
+
+    pader_train = (X_p_vib[p_train_idx], X_p_ews_train,
+                   y_p_onehot[p_train_idx], y_p_sev[p_train_idx], None) \
+        if len(p_train_idx) else None
+    pader_val = (X_p_vib[p_val_idx], X_p_ews_val,
+                 y_p_onehot[p_val_idx], y_p_sev[p_val_idx], None) \
+        if len(p_val_idx) else None
+    pader_test = (X_p_vib[p_test_idx], X_p_ews_test,
+                  y_p_onehot[p_test_idx], y_p_sev[p_test_idx], None) \
+        if len(p_test_idx) else None
+
+    train_gen = MultiModalDataGeneratorV3(
+        cwru_train, pader_train, prono_train,
+        config.batch_size, shuffle=True, config=config)
+    val_gen = MultiModalDataGeneratorV3(
+        cwru_val, pader_val, prono_val,
+        config.batch_size, shuffle=False, config=config)
+    test_gen = MultiModalDataGeneratorV3(
+        cwru_test, pader_test, prono_test,
+        config.batch_size, shuffle=False, config=config)
+
+    n_sequences = len(all_bearings)
+
+    # §E Ablations — CORRECTED NAMING (see comment block below)
+    #
+    # Reference arm: A2 (adaptive C/m, curriculum, MSE, uncertainty-weighted).
+    # Each subsequent arm varies exactly one design choice from A2:
+    #   A3: Huber instead of MSE
+    #   A4: no curriculum (fixed λ)
+    #   A5: no uncertainty weighting
+    # Baselines: A0 (all physics off), A1 (fixed C/m AND fixed λ, MSE)
+    #
+    print("\n" + "=" * 80)
+    print("§E  ADAPTIVE-PHYSICS ABLATIONS (Set A)")
+    print("=" * 80)
+
+    ablation_arms = {
+        'A0_no_physics': dict(
+            use_adaptive_physics=False, use_huber_residual=False,
+            use_physics_curriculum=False, use_uncertainty_weighting=False,
+            alpha_mono=0.0, beta_paris=0.0, gamma_consist=0.0,
+            cluster_loss_weight=0.0),
+        'A1_fixed_physics': dict(
+            use_adaptive_physics=False, use_huber_residual=False,
+            use_physics_curriculum=False, use_uncertainty_weighting=False),
+        # ---- A2 is the reference (winner) ----
+        'A2_adaptive_physics': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=True, use_uncertainty_weighting=True),
+        # ---- one-step variants ----
+        'A3_huber_residual': dict(
+            use_adaptive_physics=True, use_huber_residual=True,
+            use_physics_curriculum=True, use_uncertainty_weighting=True),
+        'A4_no_curriculum': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=False, use_uncertainty_weighting=True),
+        'A5_no_uncertainty_weight': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=True, use_uncertainty_weighting=False),
+    }
+
+    ablation_results = {}
+    trained_models = {}
+
+    for arm_name, overrides in ablation_arms.items():
+        print(f"\n{'-' * 80}\n  ARM: {arm_name}\n{'-' * 80}")
+        cfg_dict = {**config.__dict__, **overrides}
+        cfg_dict['output_dir'] = os.path.join(config.output_dir, arm_name)
+        os.makedirs(cfg_dict['output_dir'], exist_ok=True)
+        arm_cfg = ConfigV3(**cfg_dict)
+
+        if arm_cfg.use_adaptive_physics:
+            C_use, m_use = C_table.copy(), m_table.copy()
+        else:
+            C_use = np.full_like(C_table, C_median)
+            m_use = np.full_like(m_table, m_median)
+
+        set_reproducible_seed(CURRENT_SEED)
+        model = build_model_v3(arm_cfg, n_sequences)
+        curriculum = PhysicsCurriculum(
+            lambda_max_mono=arm_cfg.lambda_max_mono,
+            lambda_max_paris=arm_cfg.lambda_max_paris,
+            lambda_max_consist=arm_cfg.lambda_max_consist,
+            k=arm_cfg.curriculum_k, c0=arm_cfg.curriculum_c0)
+        trainer = MultiModalTrainerV3(model, arm_cfg, C_use, m_use, curriculum)
+        if arm_cfg.cluster_loss_weight > 0:
+            trainer.initialize_cluster_centers(train_gen,
+                                               num_clusters=arm_cfg.n_clusters)
+
+        model_trained, hist, best_vl = train_single_model_v3(
+            arm_cfg, train_gen, val_gen, trainer, epochs=arm_cfg.epochs)
+
+        try:
+            seq_w = model_trained.get_layer('seq_contribution').get_weights()
+            seq_norm = float(np.max(np.abs(seq_w[0]))) if len(seq_w) else 0.0
+            print(f"  [Leakage check] max|seq_contribution| = {seq_norm:.3e}")
+            if seq_norm > 1e-8:
+                print(f"  ⚠️ LEAKAGE: seq_contribution moved from zero.")
+        except Exception as e:
+            print(f"  (leakage check failed: {e})")
+
+        mets = evaluate_v3(model_trained, test_gen, C_use, m_use, arm_cfg)
+        ablation_results[arm_name] = {
+            'best_val_loss': best_vl,
+            'history': hist,
+            **mets,
+            'overrides': overrides,
+        }
+        trained_models[arm_name] = (model_trained, C_use, m_use, arm_cfg)
+
+        print(f"  → RMSE={mets['pronostia_rmse']:.4f}  "
+              f"MAE={mets['pronostia_mae']:.4f}  "
+              f"PHY={mets['phy_macro']:.4f}  "
+              f"PHY_refit={mets['phy_refit_macro']:.4f}")
+
+        model_path = os.path.join(arm_cfg.output_dir, f'{arm_name}.weights.h5')
+        try:
+            model_trained.save_weights(model_path)
+        except Exception as e:
+            print(f"  (weight save failed: {e})")
+
+        import gc
+        gc.collect()
+        tf.keras.backend.clear_session()
+
+    all_results['ablation_A'] = ablation_results
+
+    # §F GPR kernel ablations — DEPRECATED under Option A+C
+    print("\n" + "=" * 80)
+    print("§F  GPR KERNEL ABLATIONS (Set B) — deprecated")
+    print("=" * 80)
+    print("  (C, m) are analytic in α. No LSQ step; kernel ablation is moot.")
+    all_results['gpr_kernels'] = {'status': 'deprecated_under_option_AC'}
+    # §G UQ experiments
+    print("\n" + "=" * 80)
+    print("§G  UNCERTAINTY QUANTIFICATION (Set C)")
+    print("=" * 80)
+
+    uq_results = {}
+
+    print("\n[C1] MC Dropout")
+    model_A2, C_A2, m_A2, cfg_A2 = trained_models['A2_adaptive_physics']
+
+    def _mc_dropout_predict(model, X_vib, X_ews, seq_idx, n_passes=100):
+        x_t = tf.constant(X_vib, dtype=tf.float32)
+        e_t = tf.constant(X_ews, dtype=tf.float32)
+        s_t = tf.constant(seq_idx, dtype=tf.int32)
+
+        # [FIX-MC] Toggle only Dropout layers to True; keep
+        # BatchNormalization in inference mode. The default
+        # `model(..., training=True)` puts BN in batch-statistics
+        # mode, which makes predictions depend on the inference-batch
+        # composition — not just on dropout randomness.
+        def _enable_dropout_only():
+            states = []
+            for layer in model.layers:
+                if isinstance(layer, tf.keras.layers.Dropout):
+                    states.append((layer, layer.training))
+                    layer.training = True
+                elif isinstance(layer, tf.keras.layers.BatchNormalization):
+                    states.append((layer, layer.training))
+                    layer.training = False
+            return states
+
+        def _restore(states):
+            for layer, prev in states:
+                layer.training = prev
+
+        @tf.function(reduce_retracing=True)
+        def _pass_once(x, e, s):
+            return model([x, e, s], training=False)['pronostia_rul']
+
+        preds = []
+        for _ in range(n_passes):
+            states = _enable_dropout_only()
+            try:
+                # training=False → BN uses running stats
+                # individual Dropout layers set to training=True → stochastic
+                preds.append(_pass_once(x_t, e_t, s_t).numpy().flatten())
+            finally:
+                _restore(states)
+        preds = np.stack(preds, axis=0)
+        return preds.mean(0), preds.std(0)
+
+    X_test_vib_p = np.zeros((len(X_pr_test_vib), config.window_size, 4),
+                            dtype=np.float32)
+    X_test_vib_p[:, :, :2] = X_pr_test_vib
+    mc_mean, mc_std = _mc_dropout_predict(
+        model_A2, X_test_vib_p, X_pr_test_ews_scaled, seq_ids_testpool,
+        n_passes=config.mc_dropout_passes)
+    mc_rmse = float(np.sqrt(mean_squared_error(y_pr_test_rul, mc_mean)))
+    uq_results['C1_mc_dropout'] = {'rmse': mc_rmse,
+                                   'mean_std': float(np.mean(mc_std))}
+    print(f"  C1 MC Dropout RMSE={mc_rmse:.4f}")
+
+    val_temporal_all = pr_temporal[pr_val_idx]
+    val_order        = np.argsort(val_temporal_all)
+    n_half           = len(val_order) // 2
+    val_local_es     = val_order[:n_half]
+    val_local_cal    = val_order[n_half:]
+    val_es_idx       = pr_val_idx[val_local_es]
+    val_cal_idx      = pr_val_idx[val_local_cal]
+    print(f"  Val split: ES={len(val_es_idx)}, Cal={len(val_cal_idx)}")
+
+    def _train_gen_factory(seed):
+        cfg = ConfigV3(**{**config.__dict__, 'random_state': seed})
+        set_reproducible_seed(seed)
+        return MultiModalDataGeneratorV3(
+            cwru_train, pader_train, prono_train,
+            config.batch_size, shuffle=True, config=cfg)
+
+    def _val_gen_factory(seed):
+        Xv = X_pr_vib[val_es_idx]
+        Ev = X_pr_ews_val[val_local_es]
+        yv = y_pr_rul[val_es_idx]
+        bv = pr_bearings[val_es_idx]
+        sv = seq_ids_val[val_local_es]
+        tv = pr_temporal[val_es_idx]
+        wv = weights_val[val_local_es]
+        prono_val_es = (Xv, Ev, yv, bv, sv, tv, wv)
+        return MultiModalDataGeneratorV3(
+            cwru_val, pader_val, prono_val_es,
+            config.batch_size, shuffle=False, config=config)
+
+    print("\n[C2] Deep ensemble (no parameter sampling)")
+    C_mean_arr = C_table.copy()
+    C_std_arr = np.full_like(C_table, 1e-8)
+    m_mean_arr = m_table.copy()
+    m_std_arr = np.full_like(m_table, 1e-8)
+
+    ensemble_C2 = DeepEnsembleUQ(
+        base_config=config,
+        C_mean=C_mean_arr, C_std=C_std_arr,
+        m_mean=m_mean_arr, m_std=m_std_arr,
+        n_models=config.ensemble_size)
+    ensemble_C2.fit(_train_gen_factory, _val_gen_factory,
+                    n_sequences, train_epochs=config.ensemble_epochs)
+    ens2_mean, ens2_std, _ = ensemble_C2.predict(
+        X_test_vib_p, X_pr_test_ews_scaled, seq_ids_testpool)
+    ens2_rmse = float(np.sqrt(mean_squared_error(y_pr_test_rul, ens2_mean)))
+    uq_results['C2_ensemble_no_param_sampling'] = {
+        'rmse': ens2_rmse, 'mean_std': float(np.mean(ens2_std))}
+    print(f"  C2 RMSE={ens2_rmse:.4f}")
+
+    print("\n[C3] Deep ensemble with parameter sampling")
+    C_std_arr = np.full_like(C_table, max(0.1 * C_median, 1e-10))
+    m_std_arr = np.full_like(m_table, 0.3)
+    ensemble_C3 = DeepEnsembleUQ(
+        base_config=config,
+        C_mean=C_mean_arr, C_std=C_std_arr,
+        m_mean=m_mean_arr, m_std=m_std_arr,
+        n_models=config.ensemble_size)
+    ensemble_C3.fit(_train_gen_factory, _val_gen_factory,
+                    n_sequences, train_epochs=config.ensemble_epochs)
+    ens3_mean, ens3_std, _ = ensemble_C3.predict(
+        X_test_vib_p, X_pr_test_ews_scaled, seq_ids_testpool)
+    ens3_rmse = float(np.sqrt(mean_squared_error(y_pr_test_rul, ens3_mean)))
+    uq_results['C3_ensemble_with_param_sampling'] = {
+        'rmse': ens3_rmse, 'mean_std': float(np.mean(ens3_std))}
+    print(f"  C3 RMSE={ens3_rmse:.4f}")
+
+    print("\n[C4] C3 + split-conformal")
+    X_val_vib_p = np.zeros((len(val_cal_idx), config.window_size, 4),
+                           dtype=np.float32)
+    X_val_vib_p[:, :, :2] = X_pr_vib[val_cal_idx]
+    cal_mean, _, _ = ensemble_C3.predict(
+        X_val_vib_p,
+        X_pr_ews_val[val_local_cal],
+        seq_ids_val[val_local_cal])
+    y_cal = y_pr_rul[val_cal_idx]
+
+    conformal = SplitConformalCalibrator(alpha=config.conformal_alpha)
+    q_hat = conformal.calibrate(y_cal, cal_mean)
+    coverage = conformal.coverage(y_pr_test_rul, ens3_mean)
+    lo, hi = conformal.predict_interval(ens3_mean)
+    mpiw = float(np.mean(hi - lo))
+    uq_results['C4_conformal'] = {
+        'q_hat': q_hat,
+        'target_coverage': 1 - config.conformal_alpha,
+        'empirical_coverage': coverage,
+        'mpiw': mpiw,
+        'rmse': ens3_rmse}
+    print(f"  C4 q_hat={q_hat:.4f}, coverage={coverage:.3f}, MPIW={mpiw:.4f}")
+
+    all_results['uq'] = uq_results
+
+    # §H PHY metric
+    print("\n" + "=" * 80)
+    print("§H  PHYSICS CONSISTENCY METRIC (Set D)")
+    print("=" * 80)
+
+    phy_results = {}
+    for arm_name, (mdl, C_arm, m_arm, cfg_arm) in trained_models.items():
+        print(f"\n  [{arm_name}]")
+        mets = evaluate_v3(mdl, test_gen, C_arm, m_arm, cfg_arm)
+        phy_results[arm_name] = {
+            'phy_macro': mets['phy_macro'],
+            'phy_per_sequence': mets['phy_per_sequence'],
+            'phy_refit_macro': mets['phy_refit_macro'],
+            'rmse': mets['pronostia_rmse']}
+        print(f"    PHY={mets['phy_macro']:.4f}  "
+              f"PHY_refit={mets['phy_refit_macro']:.4f}  "
+              f"RMSE={mets['pronostia_rmse']:.4f}")
+
+    all_results['phy'] = phy_results
+
+    phy_vals = [phy_results[k]['phy_macro'] for k in phy_results]
+    rmse_vals = [phy_results[k]['rmse'] for k in phy_results]
+    if len(phy_vals) >= 3:
+        rho, p = spearmanr(phy_vals, rmse_vals)
+        all_results['phy_rmse_spearman'] = {'rho': float(rho), 'p_value': float(p)}
+        print(f"\n  Spearman PHY vs RMSE: rho={rho:.3f}, p={p:.4f}")
+
+    # §I Robustness
+    print("\n" + "=" * 80)
+    print("§I  ROBUSTNESS TO NOISY LABELS (Set E)")
+    print("=" * 80)
+
+    robustness_results = {}
+    for sigma in [0.0, 0.02, 0.05, 0.10]:
+        rng = np.random.RandomState(CURRENT_SEED)
+        y_noisy = np.clip(
+            y_pr_rul[pr_train_idx] + rng.normal(0, sigma, len(pr_train_idx)),
+            0.0, 1.0)
+
+        prono_train_noisy = (
+            X_pr_vib[pr_train_idx], X_pr_ews_train,
+            y_noisy, pr_bearings[pr_train_idx],
+            seq_ids_train, pr_temporal[pr_train_idx], weights_train)
+
+        train_gen_noisy = MultiModalDataGeneratorV3(
+            cwru_train, pader_train, prono_train_noisy,
+            config.batch_size, shuffle=True, config=config)
+
+        for mode, use_huber in [('mse', False), ('huber', True)]:
+            key = f"sigma_{sigma}_{mode}"
+            print(f"\n  [{key}]")
+            cfg_dict = {**config.__dict__,
+                        'use_huber_residual': use_huber,
+                        'use_adaptive_physics': True,
+                        'use_physics_curriculum': True,
+                        'use_uncertainty_weighting': True,
+                        'output_dir': os.path.join(config.output_dir, key)}
+            os.makedirs(cfg_dict['output_dir'], exist_ok=True)
+            cfg_r = ConfigV3(**cfg_dict)
+
+            set_reproducible_seed(CURRENT_SEED)
+            mdl_r = build_model_v3(cfg_r, n_sequences)
+            cur_r = PhysicsCurriculum(
+                lambda_max_mono=cfg_r.lambda_max_mono,
+                lambda_max_paris=cfg_r.lambda_max_paris,
+                lambda_max_consist=cfg_r.lambda_max_consist,
+                k=cfg_r.curriculum_k, c0=cfg_r.curriculum_c0)
+            tr_r = MultiModalTrainerV3(mdl_r, cfg_r, C_table, m_table, cur_r)
+            mdl_r, _, _ = train_single_model_v3(
+                cfg_r, train_gen_noisy, val_gen, tr_r, epochs=cfg_r.epochs)
+
+            mets = evaluate_v3(mdl_r, test_gen, C_table, m_table, cfg_r)
+            robustness_results[key] = {
+                'sigma': sigma, 'mode': mode,
+                'rmse': mets['pronostia_rmse'],
+                'mae': mets['pronostia_mae']}
+            print(f"    RMSE={mets['pronostia_rmse']:.4f}")
+
+            import gc
+            gc.collect()
+            tf.keras.backend.clear_session()
+
+    all_results['robustness'] = robustness_results
+
+    # §J Save results + figures
+    print("\n" + "=" * 80)
+    print("§J  SAVING RESULTS AND FIGURES")
+    print("=" * 80)
+
+    out_json = os.path.join(config.output_dir,
+                            f'v3_results_seed_{CURRENT_SEED}.json')
+    with open(out_json, 'w') as f:
+        json.dump(all_results, f, indent=2, default=str)
+    print(f"  ✓ {out_json}")
+
+    viz = TheoreticalVisualizer(config.output_dir)
+
+    gpr_fit_plot = {}
+    for b in train_bearings:
+        seq = per_seq_train.get(b)
+        gpr_out = gpr.fit_sequence(seq)
+        gpr_fit_plot[b] = {'temporal': seq['temporal'],
+                           'y_smooth': gpr_out['y_smooth'],
+                           'dy_dt': gpr_out['dy_dt']}
+    viz.plot_gpr_fits(gpr_fit_plot, 'gpr_fits.pdf')
+
+    viz.plot_C_m_scatter(
+        {b: C_m_map[b]['C'] for b in C_m_map},
+        {b: C_m_map[b]['m'] for b in C_m_map},
+        'Cm_scatter.pdf')
+
+    viz.plot_curriculum(config.epochs,
+                        PhysicsCurriculum(
+                            lambda_max_mono=config.lambda_max_mono,
+                            lambda_max_paris=config.lambda_max_paris,
+                            lambda_max_consist=config.lambda_max_consist,
+                            k=config.curriculum_k, c0=config.curriculum_c0),
+                        'curriculum.pdf')
+
+    viz.plot_phy_vs_rmse(phy_vals, rmse_vals,
+                         list(phy_results.keys()),
+                         'phy_vs_rmse.pdf')
+
+    alphas = [0.01, 0.02, 0.05, 0.10, 0.15, 0.20]
+    empirical = []
+    for a in alphas:
+        c = SplitConformalCalibrator(alpha=a)
+        c.calibrate(y_cal, cal_mean)
+        empirical.append(c.coverage(y_pr_test_rul, ens3_mean))
+    viz.plot_reliability(alphas, empirical, 'reliability_conformal.pdf')
+
+    per_seq_unseen = PerSequenceDataset(
+        X_vib=X_pr_test_vib, X_ews=X_pr_test_ews_scaled,
+        y_rul=y_pr_test_rul, bearings=pr_test_bearings,
+        temporal=pr_test_temporal, window_size=config.window_size)
+    gpr_unseen_plot = {}
+    for b in per_seq_unseen.bearings():
+        seq = per_seq_unseen.get(b)
+        if len(seq['temporal']) < 4:
+            continue
+        gpr_out = gpr.fit_sequence(seq)
+        gpr_unseen_plot[b] = {'temporal': seq['temporal'],
+                              'y_smooth': gpr_out['y_smooth'],
+                              'dy_dt': gpr_out['dy_dt']}
+    viz.plot_gpr_fits(gpr_unseen_plot, 'gpr_fits_unseen.pdf')
+    print(f"  ✓ GPR fits on {len(gpr_unseen_plot)} unseen test bearings")
+
+    print(f"\n  Figures written to {config.output_dir}")
+
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+
+    print("\n  Set A — Adaptive physics:")
+    print(f"  {'arm':<34} {'RMSE':>8} {'MAE':>8} {'PHY':>8} {'PHY_refit':>10}")
+    for k, v in ablation_results.items():
+        print(f"  {k:<34} {v['pronostia_rmse']:>8.4f} "
+              f"{v['pronostia_mae']:>8.4f} {v['phy_macro']:>8.4f} "
+              f"{v['phy_refit_macro']:>10.4f}")
+
+    print("\n  Set C — UQ:")
+    for k, v in uq_results.items():
+        print(f"  {k:<40} {v}")
+
+    print("\n  Set E — Robustness:")
+    print(f"  {'arm':<24} {'RMSE':>8}")
+    for k, v in robustness_results.items():
+        print(f"  {k:<24} {v['rmse']:>8.4f}")
+
+    print(f"\n{'=' * 80}")
+    print("DONE")
+    print(f"{'=' * 80}")
+    return all_results
+
+
+def run_multi_seed(seeds=(42, 123, 256)):
+    global CURRENT_SEED
+    all_runs = {}
+    for s in seeds:
+        print(f"\n{'#' * 80}\n# SEED {s}\n{'#' * 80}")
+        CURRENT_SEED = s
+        all_runs[s] = main_v3()
+
+    arms = list(all_runs[seeds[0]]['ablation_A'].keys())
+    print(f"\n{'=' * 80}\nAGGREGATED ACROSS SEEDS\n{'=' * 80}")
+    print(f"{'arm':<28} {'RMSE':>18} {'MAE':>18} {'PHY':>18}")
+    for arm in arms:
+        rmses = [all_runs[s]['ablation_A'][arm]['pronostia_rmse'] for s in seeds]
+        maes = [all_runs[s]['ablation_A'][arm]['pronostia_mae'] for s in seeds]
+        phys = [all_runs[s]['ablation_A'][arm]['phy_macro'] for s in seeds]
+        print(f"{arm:<28} "
+              f"{np.mean(rmses):>7.4f}+-{np.std(rmses):<7.4f} "
+              f"{np.mean(maes):>7.4f}+-{np.std(maes):<7.4f} "
+              f"{np.mean(phys):>7.4f}+-{np.std(phys):<7.4f}")
+
+    with open(os.path.join(all_runs[seeds[0]]['config']['output_dir'],
+                           'multi_seed_summary.json'), 'w') as f:
+        json.dump({s: all_runs[s] for s in seeds}, f, indent=2, default=str)
+    return all_runs
+
+
+# =============================================================
+# STAGE PERSISTENCE HELPERS
+# =============================================================
+
+import pickle
+import shutil
+
+STAGE_DIR = f"/kaggle/working/mt_supinn_v3_seed{CURRENT_SEED}"
+os.makedirs(STAGE_DIR, exist_ok=True)
+
+
+def _stage_path(name):
+    return os.path.join(STAGE_DIR, name)
+
+
+def save_stage1(payload):
+    path = _stage_path("stage1.pt")
+    with open(path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"  ✓ saved {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+
+
+def load_stage1():
+    path = _stage_path("stage1.pt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"stage1.pt not found. Run RUN_STAGE = 1 first.")
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    print(f"  ✓ loaded {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+    return payload
+
+
+def save_stage_json(stage_name, payload):
+    path = _stage_path(f"results_{stage_name}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    print(f"  ✓ saved {path}")
+
+
+def load_stage_json(stage_name):
+    path = _stage_path(f"results_{stage_name}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"results_{stage_name}.json not found. Run stage {stage_name} first.")
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def model_dir(arm_name):
+    d = _stage_path(f"models/{arm_name}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def run_stage_1():
+    set_reproducible_seed(CURRENT_SEED)
+    config = ConfigV3()
+    config.random_state = CURRENT_SEED
+
+    print(f"\n{'=' * 80}")
+    print(f"STAGE 1 — Data + Generators | Seed {CURRENT_SEED}")
+    print(f"{'=' * 80}")
+
+    # ---------- §A Load ----------
+    print("\n[A.1] CWRU")
+    cwru_loader = CWRULoader(config.cwru_path, config)
+    X_c_vib, X_c_ews, y_c_class, y_c_sev, c_files = cwru_loader.load()
+    print(f"  → {len(X_c_vib)} windows")
+
+    cwru_class_names = ['Normal', 'Ball', 'InnerRace', 'OuterRace']
+    cwru_label_map = {n: i for i, n in enumerate(cwru_class_names)}
+    le_cwru = LabelEncoder().fit(cwru_class_names)
+    le_cwru.classes_ = np.array(cwru_class_names)
+
+    def _map_cwru_label(label):
+        s = label.lower()
+        if 'normal' in s: return cwru_label_map['Normal']
+        if 'ball' in s:   return cwru_label_map['Ball']
+        if 'inner' in s or 'ir' in s: return cwru_label_map['InnerRace']
+        if 'outer' in s or 'or' in s: return cwru_label_map['OuterRace']
+        return 0
+
+    y_c_int = np.array([_map_cwru_label(l) for l in y_c_class]) if len(X_c_vib) else np.array([])
+    y_c_onehot = tf.keras.utils.to_categorical(y_c_int, 4) if len(X_c_vib) else np.array([])
+
+    print("\n[A.2] Paderborn")
+    pader_loader = PaderbornMultimodalLoader(config.paderborn_path, config)
+    X_p_vib, X_p_ews, y_p_class, y_p_sev, p_files, _ = \
+        pader_loader.load_balanced_subset(total_files=150)
+    print(f"  → {len(X_p_vib)} windows")
+    # [FIX-2] Diagnostic: show label distribution.
+    from collections import Counter as _Counter
+    print(f"  Paderborn label distribution: {dict(_Counter(y_p_class))}")
+
+    pader_class_names = ['Normal', 'InnerRace', 'OuterRace']
+    pader_label_map = {n: i for i, n in enumerate(pader_class_names)}
+    le_pader = LabelEncoder().fit(pader_class_names)
+    le_pader.classes_ = np.array(pader_class_names)
+    y_p_onehot = (tf.keras.utils.to_categorical(le_pader.transform(y_p_class), 3)
+                  if len(X_p_vib) else np.array([]))
+
+    print("\n[A.3] Pronostia")
+    prono_loader = PronostiaLoader(config.pronostia_path, config)
+    X_pr_vib, X_pr_ews, y_pr_rul, _, pr_bearings, pr_temporal = \
+        prono_loader.load_train_data(max_windows=10000, use_learning_set=True)
+    X_pr_test_vib, X_pr_test_ews, y_pr_test_rul, _, \
+        pr_test_bearings, pr_test_temporal = \
+        prono_loader.load_train_data(max_windows=5000, use_learning_set=False)
+
+    overlap = set(np.unique(pr_bearings)) & set(np.unique(pr_test_bearings))
+    assert len(overlap) == 0, f"Pronostia leakage: {sorted(overlap)}"
+    print(f"  Per-bearing α map: {dict(prono_loader._alpha_map)}")
+    # ---------- §A.4 Splits ----------
+    c_train_idx, c_val_idx, c_test_idx = [], [], []
+    if len(X_c_vib) > 0:
+        unique_files = sorted(set(c_files))
+        def _cwru_file_label(fp):
+            s = fp.lower()
+            if 'normal' in s: return cwru_label_map['Normal']
+            if 'ball' in s:   return cwru_label_map['Ball']
+            if 'inner' in s or 'ir' in s: return cwru_label_map['InnerRace']
+            if 'outer' in s or 'or' in s: return cwru_label_map['OuterRace']
+            return -1
+        file_labels = [_cwru_file_label(f) for f in unique_files]
+        valid = [i for i, l in enumerate(file_labels) if l != -1]
+        unique_files = [unique_files[i] for i in valid]
+        file_labels = [file_labels[i] for i in valid]
+        tv_files, te_files = train_test_split(
+            unique_files, test_size=0.2, random_state=CURRENT_SEED, stratify=file_labels)
+        tv_labels = [file_labels[unique_files.index(f)] for f in tv_files]
+        tr_files, va_files = train_test_split(
+            tv_files, test_size=0.25, random_state=CURRENT_SEED, stratify=tv_labels)
+        def _idx(fl): return [i for i, f in enumerate(c_files) if f in fl]
+        c_train_idx = _idx(tr_files); c_val_idx = _idx(va_files); c_test_idx = _idx(te_files)
+
+    p_train_idx, p_val_idx, p_test_idx = [], [], []
+    if len(X_p_vib) > 0 and len(p_files) > 0:
+        # [FIX-2] label via parent folder.
+        def _pader_file_label(fp):
+            cls, _ = _paderborn_label_from_path(fp)
+            return pader_label_map[cls]
+        unique_p_files = sorted(set(p_files))
+        file_labels = [_pader_file_label(f) for f in unique_p_files]
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=CURRENT_SEED)
+        tv, te = next(sss.split(unique_p_files, file_labels))
+        tv_files = [unique_p_files[i] for i in tv]
+        te_files = [unique_p_files[i] for i in te]
+        tv_labels = [file_labels[i] for i in tv]
+        sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.25, random_state=CURRENT_SEED)
+        tr, va = next(sss2.split(tv_files, tv_labels))
+        tr_files = [tv_files[i] for i in tr]
+        va_files = [tv_files[i] for i in va]
+        def _pidx(fl): return [i for i, f in enumerate(p_files) if f in fl]
+        p_train_idx = _pidx(tr_files); p_val_idx = _pidx(va_files); p_test_idx = _pidx(te_files)
+
+    FIXED_TRAIN_BEARINGS = ['Bearing1_1', 'Bearing1_2', 'Bearing3_2']
+    FIXED_VAL_BEARINGS   = ['Bearing2_1']
+    FIXED_TEST_BEARINGS  = ['Bearing3_1', 'Bearing2_2']
+    all_needed = FIXED_TRAIN_BEARINGS + FIXED_VAL_BEARINGS + FIXED_TEST_BEARINGS
+    available = set(np.unique(pr_bearings).tolist())
+    missing = [b for b in all_needed if b not in available]
+    assert not missing, f"Missing bearings: {missing}"
+
+    tr_mask = np.isin(pr_bearings, FIXED_TRAIN_BEARINGS)
+    va_mask = np.isin(pr_bearings, FIXED_VAL_BEARINGS)
+    te_mask = np.isin(pr_bearings, FIXED_TEST_BEARINGS)
+    pr_train_idx = np.where(tr_mask)[0]
+    pr_val_idx   = np.where(va_mask)[0]
+    pr_test_idx  = np.where(te_mask)[0]
+
+    # ---------- §A.5 Augmentation ----------
+    if config.use_data_augmentation and len(p_train_idx) > 0:
+        Xpt = X_p_vib[p_train_idx]; Ept = X_p_ews[p_train_idx]
+        Cpt = y_p_class[p_train_idx]; Spt = y_p_sev[p_train_idx]
+        Xa, Ea, Ca, Sa = augment_paderborn_data(Xpt, Ept, Cpt, Spt, augmentation_factor=1)
+        n_new = len(Xa) - len(Xpt)
+        X_p_vib = np.vstack([X_p_vib, Xa[len(Xpt):]])
+        X_p_ews = np.vstack([X_p_ews, Ea[len(Xpt):]])
+        y_p_class = np.concatenate([y_p_class, Ca[len(Xpt):]])
+        y_p_sev   = np.concatenate([y_p_sev,  Sa[len(Xpt):]])
+        p_files = p_files + [f"aug_{i}" for i in range(n_new)]
+        p_train_idx = list(p_train_idx) + list(range(len(X_p_vib) - n_new, len(X_p_vib)))
+        y_p_onehot = tf.keras.utils.to_categorical(le_pader.transform(y_p_class), 3)
+
+    # ---------- §A.6 EWS scaler ----------
+    train_pool = []
+    if len(c_train_idx): train_pool.append(X_c_ews[c_train_idx])
+    if len(p_train_idx): train_pool.append(X_p_ews[p_train_idx])
+    if len(pr_train_idx): train_pool.append(X_pr_ews[pr_train_idx])
+    scaler = StandardScaler().fit(np.vstack(train_pool))
+    joblib.dump(scaler, _stage_path('ews_scaler.pkl'))
+
+    X_c_ews_train = scaler.transform(X_c_ews[c_train_idx]) if len(c_train_idx) else np.array([])
+    X_c_ews_val   = scaler.transform(X_c_ews[c_val_idx])   if len(c_val_idx)   else np.array([])
+    X_c_ews_test  = scaler.transform(X_c_ews[c_test_idx])  if len(c_test_idx)  else np.array([])
+    X_p_ews_train = scaler.transform(X_p_ews[p_train_idx]) if len(p_train_idx) else np.array([])
+    X_p_ews_val   = scaler.transform(X_p_ews[p_val_idx])   if len(p_val_idx)   else np.array([])
+    X_p_ews_test  = scaler.transform(X_p_ews[p_test_idx])  if len(p_test_idx)  else np.array([])
+    X_pr_ews_train = scaler.transform(X_pr_ews[pr_train_idx]) if len(pr_train_idx) else np.array([])
+    X_pr_ews_val   = scaler.transform(X_pr_ews[pr_val_idx])   if len(pr_val_idx)   else np.array([])
+    X_pr_ews_test  = scaler.transform(X_pr_ews[pr_test_idx])  if len(pr_test_idx)  else np.array([])
+    X_pr_test_ews_scaled = scaler.transform(X_pr_test_ews)
+
+    # [Path 2] Hoist alpha_map here so it is in scope for §B below.
+    alpha_map = getattr(prono_loader, '_alpha_map', {})
+
+    # [DIAG-α] Report α spread to verify per-bearing target adaptivity.
+    alpha_vals = np.array([alpha_map[b] for b in sorted(alpha_map)])
+    print(f"\n  [α diagnostic] across all loaded bearings:")
+    print(f"    min={alpha_vals.min():.3f}  max={alpha_vals.max():.3f}  "
+          f"mean={alpha_vals.mean():.3f}  std={alpha_vals.std():.3f}")
+    print(f"    unique values: {sorted(set(alpha_vals.round(3)))}")
+    # ---------- §B Per-sequence ----------
+    per_seq_train = PerSequenceDataset(
+        X_vib=X_pr_vib[pr_train_idx], X_ews=X_pr_ews_train,
+        y_rul=y_pr_rul[pr_train_idx], bearings=pr_bearings[pr_train_idx],
+        temporal=pr_temporal[pr_train_idx], window_size=config.window_size)
+    per_seq_val = PerSequenceDataset(
+        X_vib=X_pr_vib[pr_val_idx], X_ews=X_pr_ews_val,
+        y_rul=y_pr_rul[pr_val_idx], bearings=pr_bearings[pr_val_idx],
+        temporal=pr_temporal[pr_val_idx], window_size=config.window_size)
+
+    # ---------- §C Analytic (C, m) from per-bearing α  [Option A+C] ----------
+    # No LSQ is performed.  For the power-law target y(τ) = 1 − τ^α the
+    # induced Paris parameters are exact:
+    #       C = α,   m = (α − 1) / α
+    # where α itself was fitted per bearing from the late-life RMS slope
+    # inside PronostiaLoader.load_train_data().  A GPR instance is still
+    # created because the uncertainty weights below use its predictive
+    # variance — that step is unchanged.
+    gpr = GPRRateEstimator(
+        kernel_type=config.gpr_kernel, length_scale=config.gpr_length_scale,
+        noise=config.gpr_noise, n_restarts=config.gpr_n_restarts,
+        normalize_y=config.gpr_normalize_y)
+
+    C_m_map = {}
+    _seen = set()
+    for _pds in (per_seq_train, per_seq_val):
+        for b in _pds.bearings():
+            if b in _seen:
+                continue
+            _seen.add(b)
+            _seq = _pds.get(b)
+            _alpha = float(alpha_map.get(b, config.rul_alpha))
+            C_m_map[b] = {
+                'C': _alpha,
+                'm': (_alpha - 1.0) / _alpha,
+                'alpha': _alpha,
+                'method': 'analytic_from_alpha',
+                'n_points': int(_seq['n']),
+            }
+    with open(_stage_path('Cm_map_investigation.json'), 'w') as f:
+        json.dump({k: {kk: (float(vv) if isinstance(vv, (int, float, np.floating)) else vv)
+                       for kk, vv in v.items()} for k, v in C_m_map.items()}, f, indent=2)
+
+    train_bearings = per_seq_train.bearings()
+    val_bearings   = per_seq_val.bearings()
+    heldout_bearings = sorted(set(pr_bearings[pr_test_idx].tolist()))
+    unseen_bearings  = sorted(set(pr_test_bearings.tolist()))
+
+    all_bearings = sorted(set(train_bearings) | set(val_bearings)
+                          | set(heldout_bearings) | set(unseen_bearings))
+    bearing_to_seq = {b: i for i, b in enumerate(all_bearings)}
+
+    C_train_vals = np.array([C_m_map[b]['C'] for b in train_bearings])
+    m_train_vals = np.array([C_m_map[b]['m'] for b in train_bearings])
+    C_median = float(np.median(C_train_vals))
+    m_median = float(np.median(m_train_vals))
+
+    C_table = np.zeros(len(all_bearings), dtype=np.float32)
+    m_table = np.zeros(len(all_bearings), dtype=np.float32)
+    # [Path 2] Route every bearing through its own α whenever available.
+    # alpha_map contains entries for all 17 bearings (train, val, and the
+    # 11 Full_Test_Set bearings), because PronostiaLoader computes α for
+    # every bearing it loads. The median fallback therefore only fires
+    # for a bearing that escaped both loaders — which should not happen.
+    _n_adaptive = 0
+    for b, i in bearing_to_seq.items():
+        if b in C_m_map:
+            C_table[i] = C_m_map[b]['C']
+            m_table[i] = C_m_map[b]['m']
+            _n_adaptive += 1
+        elif b in alpha_map:
+            _a = float(alpha_map[b])
+            C_table[i] = _a
+            m_table[i] = (_a - 1.0) / _a
+            _n_adaptive += 1
+        else:
+            C_table[i] = C_median
+            m_table[i] = m_median
+    print(f"  [Path 2] adaptive (C, m) set for {_n_adaptive}/"
+          f"{len(all_bearings)} bearings; median fallback for the rest.")
+
+    seq_ids_train = np.array([bearing_to_seq[b] for b in pr_bearings[pr_train_idx]], dtype=np.int32)
+    seq_ids_val   = np.array([bearing_to_seq[b] for b in pr_bearings[pr_val_idx]],   dtype=np.int32)
+    seq_ids_test  = np.array([bearing_to_seq[b] for b in pr_bearings[pr_test_idx]],  dtype=np.int32)
+    seq_ids_testpool = np.array([bearing_to_seq[b] for b in pr_test_bearings], dtype=np.int32)
+
+    train_weights_list = []
+    for b in train_bearings:
+        seq = per_seq_train.get(b)
+        gpr_out = gpr.fit_sequence(seq)
+        s2 = gpr_out['sigma2']
+        s2 = np.where(np.isnan(s2), np.nanmedian(s2), s2)
+        w = 1.0 / (s2 + config.sigma_eps)
+        w = w / (np.mean(w) + 1e-12)
+        w = np.clip(w, 0.0, 100.0)
+        train_weights_list.append(w)
+
+    weights_train = np.zeros(len(pr_train_idx), dtype=np.float32)
+    pr_train_bearings = pr_bearings[pr_train_idx]
+    pr_train_temporal = pr_temporal[pr_train_idx]
+    assigned = np.zeros(len(pr_train_idx), dtype=bool)
+    for b, w_b in zip(train_bearings, train_weights_list):
+        mask_b = pr_train_bearings == b
+        idx_b = np.where(mask_b)[0]
+        order = np.argsort(pr_train_temporal[idx_b])
+        sorted_idx_b = idx_b[order]
+        weights_train[sorted_idx_b] = w_b[:len(sorted_idx_b)]
+        assigned[sorted_idx_b] = True
+    assert assigned.all()
+    weights_val  = np.ones(len(pr_val_idx),  dtype=np.float32)
+    weights_test = np.ones(len(pr_test_idx), dtype=np.float32)
+
+    # ---------- §D Generators ----------
+    prono_train = (X_pr_vib[pr_train_idx], X_pr_ews_train, y_pr_rul[pr_train_idx],
+                   pr_bearings[pr_train_idx], seq_ids_train,
+                   pr_temporal[pr_train_idx], weights_train) if len(pr_train_idx) else None
+    prono_val   = (X_pr_vib[pr_val_idx], X_pr_ews_val, y_pr_rul[pr_val_idx],
+                   pr_bearings[pr_val_idx], seq_ids_val,
+                   pr_temporal[pr_val_idx], weights_val) if len(pr_val_idx) else None
+    prono_test  = (X_pr_vib[pr_test_idx], X_pr_ews_test, y_pr_rul[pr_test_idx],
+                   pr_bearings[pr_test_idx], seq_ids_test,
+                   pr_temporal[pr_test_idx], weights_test) if len(pr_test_idx) else None
+
+    cwru_train = (X_c_vib[c_train_idx], X_c_ews_train, y_c_onehot[c_train_idx],
+                  y_c_sev[c_train_idx], None) if len(c_train_idx) else None
+    cwru_val   = (X_c_vib[c_val_idx], X_c_ews_val, y_c_onehot[c_val_idx],
+                  y_c_sev[c_val_idx], None) if len(c_val_idx) else None
+    cwru_test  = (X_c_vib[c_test_idx], X_c_ews_test, y_c_onehot[c_test_idx],
+                  y_c_sev[c_test_idx], None) if len(c_test_idx) else None
+
+    pader_train = (X_p_vib[p_train_idx], X_p_ews_train, y_p_onehot[p_train_idx],
+                   y_p_sev[p_train_idx], None) if len(p_train_idx) else None
+    pader_val   = (X_p_vib[p_val_idx], X_p_ews_val, y_p_onehot[p_val_idx],
+                   y_p_sev[p_val_idx], None) if len(p_val_idx) else None
+    pader_test  = (X_p_vib[p_test_idx], X_p_ews_test, y_p_onehot[p_test_idx],
+                   y_p_sev[p_test_idx], None) if len(p_test_idx) else None
+
+    cfg_for_dump = config.__dict__.copy()
+    cfg_for_dump['paris_C_bounds'] = tuple(cfg_for_dump['paris_C_bounds'])
+    cfg_for_dump['paris_m_bounds'] = tuple(cfg_for_dump['paris_m_bounds'])
+    payload = {
+        'config_dict': cfg_for_dump,
+        'cwru_train': cwru_train, 'cwru_val': cwru_val, 'cwru_test': cwru_test,
+        'pader_train': pader_train, 'pader_val': pader_val, 'pader_test': pader_test,
+        'prono_train': prono_train, 'prono_val': prono_val, 'prono_test': prono_test,
+        'C_table': C_table, 'm_table': m_table,
+        'C_median': C_median, 'm_median': m_median,
+        'bearing_to_seq': bearing_to_seq,
+        'pr_test_vib': X_pr_test_vib, 'pr_test_ews_scaled': X_pr_test_ews_scaled,
+        'pr_test_rul': y_pr_test_rul, 'pr_test_bearings': pr_test_bearings,
+        'pr_test_temporal': pr_test_temporal,
+        'seq_ids_testpool': seq_ids_testpool,
+        'seq_ids_val': seq_ids_val,
+        'pr_val_ews_scaled': X_pr_ews_val,
+        'pr_val_temporal': pr_temporal[pr_val_idx],
+        'pr_val_rul': y_pr_rul[pr_val_idx],
+        'pr_val_bearings': pr_bearings[pr_val_idx],
+        'weights_val': weights_val,
+        'C_m_map': C_m_map,
+        'window_size': config.window_size,
+        'prono_alpha_map': dict(prono_loader._alpha_map),
+    }
+    save_stage1(payload)
+    print("\n✅ STAGE 1 complete.")
+
+
+def run_stage_2():
+    print(f"\n{'=' * 80}")
+    print(f"STAGE 2 — Main Ablation | Seed {CURRENT_SEED}")
+    print(f"{'=' * 80}")
+    s1 = load_stage1()
+
+    config = ConfigV3(**s1['config_dict'])
+    config.random_state = CURRENT_SEED
+    config.output_dir = STAGE_DIR
+
+    train_gen = MultiModalDataGeneratorV3(
+        s1['cwru_train'], s1['pader_train'], s1['prono_train'],
+        config.batch_size, shuffle=True, config=config)
+    val_gen = MultiModalDataGeneratorV3(
+        s1['cwru_val'], s1['pader_val'], s1['prono_val'],
+        config.batch_size, shuffle=False, config=config)
+    test_gen = MultiModalDataGeneratorV3(
+        s1['cwru_test'], s1['pader_test'], s1['prono_test'],
+        config.batch_size, shuffle=False, config=config)
+
+    C_table = s1['C_table']; m_table = s1['m_table']
+    C_median = s1['C_median']; m_median = s1['m_median']
+    n_sequences = len(s1['bearing_to_seq'])
+
+    # [FIX-3] Aligned with main_v3: A2 = MSE reference, A3 = Huber.
+    ablation_arms = {
+        'A0_no_physics': dict(
+            use_adaptive_physics=False, use_huber_residual=False,
+            use_physics_curriculum=False, use_uncertainty_weighting=False,
+            alpha_mono=0.0, beta_paris=0.0, gamma_consist=0.0,
+            cluster_loss_weight=0.0),
+        'A1_fixed_physics': dict(
+            use_adaptive_physics=False, use_huber_residual=False,
+            use_physics_curriculum=False, use_uncertainty_weighting=False),
+        'A2_adaptive_physics': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=True, use_uncertainty_weighting=True),
+        'A3_huber_residual': dict(
+            use_adaptive_physics=True, use_huber_residual=True,
+            use_physics_curriculum=True, use_uncertainty_weighting=True),
+        'A4_no_curriculum': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=False, use_uncertainty_weighting=True),
+        'A5_no_uncertainty_weight': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=True, use_uncertainty_weighting=False),
+    }
+
+    results = {}
+    for arm_name, overrides in ablation_arms.items():
+        print(f"\n{'─' * 80}\n  ARM: {arm_name}\n{'─' * 80}")
+        arm_cfg = ConfigV3(**{**config.__dict__, **overrides})
+        arm_cfg.output_dir = _stage_path(f"outputs/{arm_name}")
+        os.makedirs(arm_cfg.output_dir, exist_ok=True)
+
+        if arm_cfg.use_adaptive_physics:
+            C_use, m_use = C_table.copy(), m_table.copy()
+        else:
+            C_use = np.full_like(C_table, C_median)
+            m_use = np.full_like(m_table, m_median)
+
+        set_reproducible_seed(CURRENT_SEED)
+        model = build_model_v3(arm_cfg, n_sequences)
+        curriculum = PhysicsCurriculum(
+            lambda_max_mono=arm_cfg.lambda_max_mono,
+            lambda_max_paris=arm_cfg.lambda_max_paris,
+            lambda_max_consist=arm_cfg.lambda_max_consist,
+            k=arm_cfg.curriculum_k, c0=arm_cfg.curriculum_c0)
+        trainer = MultiModalTrainerV3(model, arm_cfg, C_use, m_use, curriculum)
+        if arm_cfg.cluster_loss_weight > 0:
+            trainer.initialize_cluster_centers(train_gen, num_clusters=arm_cfg.n_clusters)
+
+        model_trained, hist, best_vl = train_single_model_v3(
+            arm_cfg, train_gen, val_gen, trainer, epochs=arm_cfg.epochs)
+
+        try:
+            seq_w = model_trained.get_layer('seq_contribution').get_weights()
+            seq_norm = float(np.max(np.abs(seq_w[0]))) if len(seq_w) else 0.0
+            print(f"  [Leakage check] max|seq_contribution| = {seq_norm:.3e}")
+        except Exception as e:
+            print(f"  (leakage check failed: {e})")
+
+        mets = evaluate_v3(model_trained, test_gen, C_use, m_use, arm_cfg)
+        results[arm_name] = {
+            'best_val_loss': best_vl,
+            'history_loss': hist['loss'],
+            'history_val_loss': hist['val_loss'],
+            **{k: v for k, v in mets.items() if k != 'phy_per_sequence'},
+            'phy_per_sequence': mets['phy_per_sequence'],
+            'overrides': overrides,
+        }
+        print(f"  → RMSE={mets['pronostia_rmse']:.4f}  "
+              f"MAE={mets['pronostia_mae']:.4f}  "
+              f"PHY={mets['phy_macro']:.4f}  "
+              f"PHY_refit={mets['phy_refit_macro']:.4f}")
+
+        weights_path = os.path.join(model_dir(arm_name), 'model.weights.h5')
+        try:
+            model_trained.save_weights(weights_path)
+            print(f"  ✓ saved {weights_path}")
+        except Exception as e:
+            print(f"  (weight save failed: {e})")
+
+        np.save(os.path.join(model_dir(arm_name), 'C_use.npy'), C_use)
+        np.save(os.path.join(model_dir(arm_name), 'm_use.npy'), m_use)
+
+        import gc; gc.collect()
+        tf.keras.backend.clear_session()
+
+    save_stage_json('E', results)
+    print("\n✅ STAGE 2 complete.")
+
+
+def load_arm_model(arm_name, n_sequences=None, s1=None):
+    if s1 is None:
+        s1 = load_stage1()
+    config = ConfigV3(**s1['config_dict'])
+    config.random_state = CURRENT_SEED
+    if n_sequences is None:
+        n_sequences = len(s1['bearing_to_seq'])
+
+    model = build_model_v3(config, n_sequences)
+    weights_path = os.path.join(model_dir(arm_name), 'model.weights.h5')
+    model.load_weights(weights_path)
+    C_use = np.load(os.path.join(model_dir(arm_name), 'C_use.npy'))
+    m_use = np.load(os.path.join(model_dir(arm_name), 'm_use.npy'))
+    return model, C_use, m_use
+
+
+def run_stage_3():
+    """
+    [Option A+C] Deprecated.  Stage 3 previously tested GPR kernel
+    robustness of the LSQ Paris fit.  Under Option A+C the parameters
+    (C, m) are analytic in the per-bearing α; there is no LSQ step to
+    stress-test.  This stub exists so the stage selector does not
+    break.
+    """
+    print(f"\n{'=' * 80}")
+    print(f"STAGE 3 — DEPRECATED under Option A+C | Seed {CURRENT_SEED}")
+    print(f"{'=' * 80}")
+    print("  (C, m) = f(α) analytically. No LSQ to be robust to. No-op.")
+    save_stage_json('F', {'status': 'deprecated_under_option_AC'})
+    print("\n✅ STAGE 3 complete (no-op).")
+
+
+def run_stage_4():
+    print(f"\n{'=' * 80}")
+    print(f"STAGE 4 — UQ | Seed {CURRENT_SEED}")
+    print(f"{'=' * 80}")
+    s1 = load_stage1()
+    config = ConfigV3(**s1['config_dict'])
+    config.random_state = CURRENT_SEED
+    config.output_dir = STAGE_DIR
+
+    n_sequences = len(s1['bearing_to_seq'])
+    C_table = s1['C_table']; m_table = s1['m_table']
+    C_median = s1['C_median']
+
+    X_pr_test_vib = s1['pr_test_vib']
+    X_pr_test_ews_scaled = s1['pr_test_ews_scaled']
+    y_pr_test_rul = s1['pr_test_rul']
+    seq_ids_testpool = s1['seq_ids_testpool']
+
+    results = {}
+
+    val_temporal = s1['pr_val_temporal']
+    val_order    = np.argsort(val_temporal)
+    n_half       = len(val_order) // 2
+    val_es_idx   = val_order[:n_half]
+    val_cal_idx  = val_order[n_half:]
+    print(f"  Val split: ES={len(val_es_idx)}, Cal={len(val_cal_idx)}")
+
+    print("\n[C1] MC Dropout")
+    model_A2, _, _ = load_arm_model('A2_adaptive_physics', n_sequences)
+    X_test_vib_p = np.zeros((len(X_pr_test_vib), config.window_size, 4), dtype=np.float32)
+    X_test_vib_p[:, :, :2] = X_pr_test_vib
+
+    X_test_vib_t = tf.constant(X_test_vib_p)
+    X_test_ews_t = tf.constant(X_pr_test_ews_scaled)
+    seq_test_t   = tf.constant(seq_ids_testpool)
+
+    @tf.function(reduce_retracing=True)
+    def _mc_pass(x, e, s):
+        return model_A2([x, e, s], training=True)['pronostia_rul']
+
+    mc_preds = []
+    for _ in range(config.mc_dropout_passes):
+        mc_preds.append(_mc_pass(X_test_vib_t, X_test_ews_t, seq_test_t)
+                        .numpy().flatten())
+    mc_preds = np.stack(mc_preds, axis=0)
+    mc_mean = mc_preds.mean(0); mc_std = mc_preds.std(0)
+    results['C1_mc_dropout'] = {
+        'rmse': float(np.sqrt(mean_squared_error(y_pr_test_rul, mc_mean))),
+        'mean_std': float(np.mean(mc_std)),
+    }
+
+    print("\n[C2] Deep ensemble (no parameter sampling)")
+    def _train_gen_factory(seed):
+        cfg = ConfigV3(**{**config.__dict__, 'random_state': seed})
+        set_reproducible_seed(seed)
+        return MultiModalDataGeneratorV3(
+            s1['cwru_train'], s1['pader_train'], s1['prono_train'],
+            config.batch_size, shuffle=True, config=cfg)
+
+    def _val_gen_factory(seed):
+        Xv = s1['prono_val'][0][val_es_idx]
+        Ev = s1['pr_val_ews_scaled'][val_es_idx]
+        yv = s1['pr_val_rul'][val_es_idx]
+        bv = s1['pr_val_bearings'][val_es_idx]
+        sv = s1['seq_ids_val'][val_es_idx]
+        tv = s1['pr_val_temporal'][val_es_idx]
+        wv = s1['weights_val'][val_es_idx]
+        prono_val_es = (Xv, Ev, yv, bv, sv, tv, wv)
+        return MultiModalDataGeneratorV3(
+            s1['cwru_val'], s1['pader_val'], prono_val_es,
+            config.batch_size, shuffle=False, config=config)
+
+    C_mean_arr = C_table.copy(); C_std_arr = np.full_like(C_table, 1e-8)
+    m_mean_arr = m_table.copy(); m_std_arr = np.full_like(m_table, 1e-8)
+    ens_C2 = DeepEnsembleUQ(config, C_mean_arr, C_std_arr, m_mean_arr, m_std_arr,
+                            n_models=config.ensemble_size)
+    ens_C2.fit(_train_gen_factory, _val_gen_factory, n_sequences,
+               train_epochs=config.ensemble_epochs)
+    ens2_mean, ens2_std, _ = ens_C2.predict(X_test_vib_p, X_pr_test_ews_scaled, seq_ids_testpool)
+    results['C2_ensemble_no_param_sampling'] = {
+        'rmse': float(np.sqrt(mean_squared_error(y_pr_test_rul, ens2_mean))),
+        'mean_std': float(np.mean(ens2_std)),
+    }
+
+    print("\n[C3] Deep ensemble with parameter sampling")
+    C_std_arr = np.full_like(C_table, max(0.1 * C_median, 1e-10))
+    m_std_arr = np.full_like(m_table, 0.3)
+    ens_C3 = DeepEnsembleUQ(config, C_mean_arr, C_std_arr, m_mean_arr, m_std_arr,
+                            n_models=config.ensemble_size)
+    ens_C3.fit(_train_gen_factory, _val_gen_factory, n_sequences,
+               train_epochs=config.ensemble_epochs)
+    ens3_mean, ens3_std, _ = ens_C3.predict(X_test_vib_p, X_pr_test_ews_scaled, seq_ids_testpool)
+    results['C3_ensemble_with_param_sampling'] = {
+        'rmse': float(np.sqrt(mean_squared_error(y_pr_test_rul, ens3_mean))),
+        'mean_std': float(np.mean(ens3_std)),
+    }
+
+    print("\n[C4] Split-conformal")
+
+    X_val_cal_vib_p = np.zeros((len(val_cal_idx), config.window_size, 4), dtype=np.float32)
+    X_val_cal_vib_p[:, :, :2] = s1['prono_val'][0][val_cal_idx]
+    X_val_cal_ews = s1['pr_val_ews_scaled'][val_cal_idx]
+    X_val_cal_seq = s1['seq_ids_val'][val_cal_idx]
+    cal_mean, _, _ = ens_C3.predict(X_val_cal_vib_p, X_val_cal_ews, X_val_cal_seq)
+    y_cal = s1['pr_val_rul'][val_cal_idx]
+
+    conformal = SplitConformalCalibrator(alpha=config.conformal_alpha)
+    q_hat = conformal.calibrate(y_cal, cal_mean)
+    coverage = conformal.coverage(y_pr_test_rul, ens3_mean)
+    lo, hi = conformal.predict_interval(ens3_mean)
+    mpiw = float(np.mean(hi - lo))
+    results['C4_conformal'] = {
+        'q_hat': q_hat,
+        'target_coverage': 1 - config.conformal_alpha,
+        'empirical_coverage': coverage,
+        'mpiw': mpiw,
+        'rmse': float(np.sqrt(mean_squared_error(y_pr_test_rul, ens3_mean))),
+    }
+    print(f"  C4 q_hat={q_hat:.4f}, coverage={coverage:.3f}, MPIW={mpiw:.4f}")
+
+    save_stage_json('G', results)
+    print("\n✅ STAGE 4 complete.")
+
+
+def run_stage_5():
+    print(f"\n{'=' * 80}")
+    print(f"STAGE 5 — PHY Metric | Seed {CURRENT_SEED}")
+    print(f"{'=' * 80}")
+    s1 = load_stage1()
+    results_E = load_stage_json('E')
+    config = ConfigV3(**s1['config_dict'])
+    config.random_state = CURRENT_SEED
+
+    n_sequences = len(s1['bearing_to_seq'])
+    test_gen = MultiModalDataGeneratorV3(
+        s1['cwru_test'], s1['pader_test'], s1['prono_test'],
+        config.batch_size, shuffle=False, config=config)
+
+    results = {}
+    for arm_name in results_E:
+        mdl, C_use, m_use = load_arm_model(arm_name, n_sequences, s1=s1)
+        mets = evaluate_v3(mdl, test_gen, C_use, m_use, config)
+        results[arm_name] = {
+            'phy_macro': mets['phy_macro'],
+            'phy_per_sequence': mets['phy_per_sequence'],
+            'phy_refit_macro': mets['phy_refit_macro'],
+            'rmse': mets['pronostia_rmse'],
+            'mae': mets['pronostia_mae'],
+        }
+        print(f"  [{arm_name}] PHY={mets['phy_macro']:.4f}  "
+              f"PHY_refit={mets['phy_refit_macro']:.4f}  "
+              f"RMSE={mets['pronostia_rmse']:.4f}")
+        tf.keras.backend.clear_session()
+
+    phy_vals = [results[k]['phy_macro'] for k in results]
+    rmse_vals = [results[k]['rmse'] for k in results]
+    if len(phy_vals) >= 3:
+        rho, p = spearmanr(phy_vals, rmse_vals)
+        results['_spearman'] = {'rho': float(rho), 'p_value': float(p)}
+
+    save_stage_json('H', results)
+    print("\n✅ STAGE 5 complete.")
+
+
+def run_stage_6():
+    print(f"\n{'=' * 80}")
+    print(f"STAGE 6 — Robustness | Seed {CURRENT_SEED}")
+    print(f"{'=' * 80}")
+    s1 = load_stage1()
+    config = ConfigV3(**s1['config_dict'])
+    config.random_state = CURRENT_SEED
+    config.output_dir = STAGE_DIR
+
+    n_sequences = len(s1['bearing_to_seq'])
+    C_table = s1['C_table']; m_table = s1['m_table']
+
+    val_gen = MultiModalDataGeneratorV3(
+        s1['cwru_val'], s1['pader_val'], s1['prono_val'],
+        config.batch_size, shuffle=False, config=config)
+    test_gen = MultiModalDataGeneratorV3(
+        s1['cwru_test'], s1['pader_test'], s1['prono_test'],
+        config.batch_size, shuffle=False, config=config)
+
+    pr_train = s1['prono_train']
+    y_train_rul = pr_train[2].copy()
+    results = {}
+
+    for sigma in [0.0, 0.02, 0.05, 0.10]:
+        rng = np.random.RandomState(CURRENT_SEED)
+        y_noisy = np.clip(y_train_rul + rng.normal(0, sigma, len(y_train_rul)), 0.0, 1.0)
+        prono_train_noisy = (
+            pr_train[0], pr_train[1], y_noisy, pr_train[3],
+            pr_train[4], pr_train[5], pr_train[6])
+        train_gen_noisy = MultiModalDataGeneratorV3(
+            s1['cwru_train'], s1['pader_train'], prono_train_noisy,
+            config.batch_size, shuffle=True, config=config)
+
+        for mode, use_huber in [('mse', False), ('huber', True)]:
+            key = f"sigma_{sigma}_{mode}"
+            print(f"\n  [{key}]")
+            cfg = ConfigV3(**{**config.__dict__,
+                              'use_huber_residual': use_huber,
+                              'use_adaptive_physics': True,
+                              'use_physics_curriculum': True,
+                              'use_uncertainty_weighting': True,
+                              'output_dir': _stage_path(f"outputs/{key}")})
+            os.makedirs(cfg.output_dir, exist_ok=True)
+            set_reproducible_seed(CURRENT_SEED)
+            mdl = build_model_v3(cfg, n_sequences)
+            cur = PhysicsCurriculum(
+                lambda_max_mono=cfg.lambda_max_mono,
+                lambda_max_paris=cfg.lambda_max_paris,
+                lambda_max_consist=cfg.lambda_max_consist,
+                k=cfg.curriculum_k, c0=cfg.curriculum_c0)
+            tr = MultiModalTrainerV3(mdl, cfg, C_table, m_table, cur)
+            mdl, _, _ = train_single_model_v3(cfg, train_gen_noisy, val_gen, tr,
+                                              epochs=cfg.epochs)
+            mets = evaluate_v3(mdl, test_gen, C_table, m_table, cfg)
+            results[key] = {
+                'sigma': sigma, 'mode': mode,
+                'rmse': mets['pronostia_rmse'],
+                'mae': mets['pronostia_mae'],
+            }
+            print(f"    RMSE={mets['pronostia_rmse']:.4f}")
+            import gc; gc.collect()
+            tf.keras.backend.clear_session()
+
+    save_stage_json('I', results)
+    print("\n✅ STAGE 6 complete.")
+
+
+def run_stage_7():
+    print(f"\n{'=' * 80}")
+    print(f"STAGE 7 — Figures | Seed {CURRENT_SEED}")
+    print(f"{'=' * 80}")
+    s1 = load_stage1()
+    config = ConfigV3(**s1['config_dict'])
+    fig_dir = _stage_path(f"figures_seed_{CURRENT_SEED}")
+    os.makedirs(fig_dir, exist_ok=True)
+    viz = TheoreticalVisualizer(fig_dir)
+
+    results_E = load_stage_json('E')
+    results_H = load_stage_json('H')
+
+    for arm_name, r in results_E.items():
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(r['history_loss'], label='train')
+        ax.plot(r['history_val_loss'], label='val')
+        ax.set_xlabel('Epoch'); ax.set_ylabel('Loss')
+        ax.set_title(f'{arm_name} training curves')
+        ax.legend(); ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(fig_dir, f'curves_{arm_name}.pdf'))
+        plt.close()
+
+    phy_vals = [results_H[k]['phy_macro'] for k in results_H if k != '_spearman']
+    rmse_vals = [results_H[k]['rmse'] for k in results_H if k != '_spearman']
+    labels = [k for k in results_H if k != '_spearman']
+    viz.plot_phy_vs_rmse(phy_vals, rmse_vals, labels, 'phy_vs_rmse.pdf')
+
+    C_m_map = s1['C_m_map']
+    viz.plot_C_m_scatter(
+        {b: C_m_map[b]['C'] for b in C_m_map},
+        {b: C_m_map[b]['m'] for b in C_m_map},
+        'Cm_scatter.pdf')
+
+    viz.plot_curriculum(
+        config.epochs,
+        PhysicsCurriculum(
+            lambda_max_mono=config.lambda_max_mono,
+            lambda_max_paris=config.lambda_max_paris,
+            lambda_max_consist=config.lambda_max_consist,
+            k=config.curriculum_k, c0=config.curriculum_c0),
+        'curriculum.pdf')
+
+    print(f"  ✓ figures saved to {fig_dir}")
+    print("\n✅ STAGE 7 complete.")
+
+# =============================================================
+# LOBOCV — Leave-One-Bearing-Out Cross-Validation
+# =============================================================
+# Supports two modes:
+#   fixed_alpha=None   → use per-bearing α from stage1.pt (current)
+#   fixed_alpha=<float> → override all RUL targets to y = 1 - τ^α,
+#                          set C = α and m = (α-1)/α uniformly,
+#                          use a SEPARATE cache dir so results don't
+#                          collide with the per-bearing runs.
+LOBOCV_DIR = f"/kaggle/working/mt_supinn_v3_seed{CURRENT_SEED}/lobocv"
+os.makedirs(LOBOCV_DIR, exist_ok=True)
+
+LEARN_BEARINGS = ['Bearing1_1', 'Bearing1_2', 'Bearing2_1',
+                  'Bearing2_2', 'Bearing3_1', 'Bearing3_2']
+ALL_BEARINGS = [
+    # 6 learning bearings
+    'Bearing1_1', 'Bearing1_2', 'Bearing2_1', 'Bearing2_2',
+    'Bearing3_1', 'Bearing3_2',
+    # 11 test-pool bearings
+    'Bearing1_3', 'Bearing1_4', 'Bearing1_5', 'Bearing1_6', 'Bearing1_7',
+    'Bearing2_3', 'Bearing2_4', 'Bearing2_5', 'Bearing2_6', 'Bearing2_7',
+    'Bearing3_3',
+]
+
+def _lobocv_fold_assignment():
+    n = len(ALL_BEARINGS)
+    folds = []
+    for i in range(n):
+        test_b = ALL_BEARINGS[i]
+        val_b = ALL_BEARINGS[(i + 1) % n]
+        train_bs = [b for b in ALL_BEARINGS if b != test_b and b != val_b]
+        folds.append({'fold': i + 1,
+                      'test': test_b, 'val': val_b, 'train': train_bs})
+    return folds
+
+
+def _lobocv_path(cache_dir, fold_id, arm_name):
+    return os.path.join(cache_dir, f"fold{fold_id}_{arm_name}.json")
+
+
+def _lobocv_load(cache_dir, fold_id, arm_name):
+    p = _lobocv_path(cache_dir, fold_id, arm_name)
+    if not os.path.exists(p):
+        return None
+    with open(p) as f:
+        return json.load(f)
+
+
+def _lobocv_save(cache_dir, fold_id, arm_name, payload):
+    with open(_lobocv_path(cache_dir, fold_id, arm_name), 'w') as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
+def _precompute_bearing_weights(s1, config):
+    """Fit GPR per bearing over the merged 17-bearing pool."""
+    # 6 learning bearings
+    learn = tuple(np.concatenate(
+        [s1['prono_train'][i], s1['prono_val'][i], s1['prono_test'][i]], axis=0)
+        for i in range(7))
+
+    # 11 test-pool bearings (weights will be recomputed below)
+    test_weights = np.ones(len(s1['pr_test_bearings']), dtype=np.float32)
+    test = (s1['pr_test_vib'], s1['pr_test_ews_scaled'], s1['pr_test_rul'],
+            s1['pr_test_bearings'], s1['seq_ids_testpool'],
+            s1['pr_test_temporal'], test_weights)
+
+    full = tuple(np.concatenate([learn[i], test[i]], axis=0) for i in range(7))
+
+    gpr = GPRRateEstimator(
+        kernel_type=config.gpr_kernel, length_scale=config.gpr_length_scale,
+        noise=config.gpr_noise, n_restarts=config.gpr_n_restarts,
+        normalize_y=config.gpr_normalize_y)
+
+    _, _, y_rul, bearings, _, temporal, _ = full
+    per_bearing_weights = {}
+    for b in ALL_BEARINGS:
+        mask = bearings == b
+        if not mask.any():
+            print(f"  [warn] {b}: no samples in pool")
+            continue
+        order = np.argsort(temporal[mask])
+        seq_t = temporal[mask][order]
+        seq_r = y_rul[mask][order]
+        gpr_out = gpr.fit_predict(seq_t, seq_r)
+        s2 = gpr_out['sigma2']
+        s2 = np.where(np.isnan(s2), np.nanmedian(s2), s2)
+        w = 1.0 / (s2 + config.sigma_eps)
+        w = w / (np.mean(w) + 1e-12)
+        w = np.clip(w, 0.0, 100.0)
+        per_bearing_weights[b] = w
+        print(f"  [LOBOCV weights] {b}: n={len(seq_t)} "
+              f"w∈[{w.min():.3f},{w.max():.3f}]")
+    return full, per_bearing_weights
+
+
+def _build_fold_data(full, per_bearing_weights, fold_spec,
+                     noise_sigma=None, keep_frac=None,
+                     input_noise_sigma=None):
+    """
+    Build fold-specific train/val/test, optionally adding label noise
+    or sparsifying only the TRAIN set. Val and test stay clean so the
+    A0 vs A2 comparison is fair.
+    """
+    X_vib, X_ews, y_rul, bearings, seq_ids, temporal, _ = full
+
+    def _slice(mask_bearings):
+        m = np.isin(bearings, mask_bearings)
+        idx = np.where(m)[0]
+        w = np.ones(len(idx), dtype=np.float32)
+        for b in mask_bearings:
+            if b not in per_bearing_weights:
+                continue
+            is_b = (bearings[idx] == b)
+            if not is_b.any():
+                continue
+            pos_in_slice = np.where(is_b)[0]
+            b_temporal = temporal[idx][pos_in_slice]
+            sort_order = np.argsort(b_temporal)
+            pos_sorted = pos_in_slice[sort_order]
+            w_sorted = per_bearing_weights[b]
+            n = min(len(pos_sorted), len(w_sorted))
+            w[pos_sorted[:n]] = w_sorted[:n]
+        return (X_vib[m], X_ews[m], y_rul[m], bearings[m],
+                seq_ids[m], temporal[m], w)
+
+    p_train = _slice(fold_spec['train'])
+    p_val = _slice([fold_spec['val']])
+    p_test = _slice([fold_spec['test']])
+
+    # ---- apply train-only label noise ----
+    if noise_sigma is not None and noise_sigma > 0:
+        Xv, Xe, y, b, s, t, w = p_train
+        rng = np.random.RandomState(CURRENT_SEED + 1000 + fold_spec.get('fold', 0))
+        noise = rng.normal(0.0, noise_sigma, len(y)).astype(np.float32)
+        y = np.clip(y + noise, 0.0, 1.0).astype(np.float32)
+        p_train = (Xv, Xe, y, b, s, t, w)
+        print(f"    [label-noise] train targets: σ={noise_sigma}, "
+              f"mean={float(y.mean()):.3f}, std={float(y.std()):.3f}")
+
+    # ---- apply train-only input noise ----
+    # sigma is expressed as a fraction of the per-channel std of the
+    # training set, so the noise magnitude scales with signal strength.
+    if input_noise_sigma is not None and input_noise_sigma > 0:
+        Xv, Xe, y, b, s, t, w = p_train
+        rng = np.random.RandomState(CURRENT_SEED + 3000 + fold_spec.get('fold', 0))
+        # Xv: (n, window, channels)
+        per_ch_std = Xv.reshape(-1, Xv.shape[-1]).std(axis=0)  # (channels,)
+        per_ch_std = np.maximum(per_ch_std, 1e-6)
+        noise = rng.normal(
+            0.0,
+            input_noise_sigma * per_ch_std[None, None, :],
+            Xv.shape,
+        ).astype(np.float32)
+        Xv = (Xv + noise).astype(np.float32)
+        p_train = (Xv, Xe, y, b, s, t, w)
+        print(f"    [input-noise] train X_vib: σ={input_noise_sigma} "
+              f"× per-channel std")
+
+    # ---- apply train-only subsampling ----
+    if keep_frac is not None and 0.0 < keep_frac < 1.0:
+        Xv, Xe, y, b, s, t, w = p_train
+        n_orig = len(y)
+        n_keep = max(int(n_orig * keep_frac), 200)
+        if n_keep < n_orig:
+            rng = np.random.RandomState(CURRENT_SEED + 2000 + fold_spec.get('fold', 0))
+            idx = np.sort(rng.choice(n_orig, n_keep, replace=False))
+            p_train = (Xv[idx], Xe[idx], y[idx], b[idx],
+                       s[idx], t[idx], w[idx])
+            print(f"    [sparsity] train: {n_orig} → {n_keep} windows "
+                  f"(keep_frac={keep_frac})")
+
+    return p_train, p_val, p_test
+
+
+
+def run_lobocv(folds_to_run=None, arms_to_run=None, epochs_override=None,
+               fixed_alpha=None, target_noise_sigma=None,
+               sparsity_keep_frac=None, input_noise_sigma=None,
+               tag_suffix=''):
+    """
+    LOBOCV with optional target noise, train sparsity, or fixed-α override.
+    Each variant writes to its own cache dir; safe to run all variants
+    sequentially without overwriting each other.
+    """
+    variant_parts = []
+    if fixed_alpha is not None:
+        variant_parts.append(f'alpha{fixed_alpha}')
+    if target_noise_sigma is not None and target_noise_sigma > 0:
+        variant_parts.append(f'noise{target_noise_sigma}')
+    if sparsity_keep_frac is not None and sparsity_keep_frac < 1.0:
+        variant_parts.append(f'sparse{sparsity_keep_frac}')
+    if input_noise_sigma is not None and input_noise_sigma > 0:
+        variant_parts.append(f'xnoise{input_noise_sigma}')
+    variant = '_'.join(variant_parts) if variant_parts else 'clean'
+    if tag_suffix:
+        variant += '_' + tag_suffix
+    # Include the target mode in the cache key so that re-running stage 1
+    # with a different `rul_target_mode` produces a fresh cache directory
+    # rather than silently reusing results from a different target.
+    tmode = getattr(ConfigV3(), 'rul_target_mode', 'power')
+    if tmode != 'power':
+        variant += f'_tgt{tmode}'
+
+    print(f"\n{'=' * 80}\nLOBOCV — Seed {CURRENT_SEED} — variant={variant}\n{'=' * 80}")
+
+    s1 = load_stage1()
+    config = ConfigV3(**s1['config_dict'])
+    config.random_state = CURRENT_SEED
+    config.output_dir = STAGE_DIR
+    if epochs_override is not None:
+        config.epochs = epochs_override
+
+    cache_dir = os.path.join(STAGE_DIR, f"lobocv_{variant}")
+    os.makedirs(cache_dir, exist_ok=True)
+    print(f"  cache: {cache_dir}")
+
+    # ---- fixed-alpha override (unchanged) ----
+    if fixed_alpha is not None:
+        fa = float(fixed_alpha)
+        def _regen(tup):
+            Xv, Xe, _y, b, s, t, w = tup
+            tau = np.clip(t, 0.0, 1.0)
+            return (Xv, Xe, (1.0 - tau ** fa).astype(np.float32), b, s, t, w)
+        s1['prono_train'] = _regen(s1['prono_train'])
+        s1['prono_val']   = _regen(s1['prono_val'])
+        s1['prono_test']  = _regen(s1['prono_test'])
+        s1['pr_test_rul'] = (1.0 - np.clip(s1['pr_test_temporal'], 0, 1) ** fa
+                             ).astype(np.float32)
+        s1['pr_val_rul']  = (1.0 - np.clip(s1['pr_val_temporal'], 0, 1) ** fa
+                             ).astype(np.float32)
+        s1['C_table'] = np.full_like(s1['C_table'], fa, dtype=np.float32)
+        s1['m_table'] = np.full_like(s1['m_table'], (fa-1)/fa, dtype=np.float32)
+        s1['C_median'] = fa
+        s1['m_median'] = (fa-1)/fa
+
+    arms_all = {
+        'A0_no_physics': dict(
+            use_adaptive_physics=False, use_huber_residual=False,
+            use_physics_curriculum=False, use_uncertainty_weighting=False,
+            alpha_mono=0.0, beta_paris=0.0, gamma_consist=0.0,
+            cluster_loss_weight=0.0),
+        'A2_adaptive_physics': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=True, use_uncertainty_weighting=True),
+        'A5_no_uncertainty_weight': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=True, use_uncertainty_weighting=False),
+        'A6_no_clustering': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=True, use_uncertainty_weighting=True,
+            cluster_loss_weight=0.0),
+    }
+    if arms_to_run is None:
+        arms_to_run = ['A0_no_physics', 'A2_adaptive_physics']
+
+    C_table = s1['C_table']; m_table = s1['m_table']
+    C_median = s1['C_median']; m_median = s1['m_median']
+    n_sequences = len(s1['bearing_to_seq'])
+
+    folds = _lobocv_fold_assignment()
+    if folds_to_run is not None:
+        folds = [f for f in folds if f['fold'] in folds_to_run]
+
+    print("\n[LOBOCV] Precomputing per-bearing GPR weights...")
+    full, per_bearing_weights = _precompute_bearing_weights(s1, config)
+
+    cwru_train, cwru_val, cwru_test = (
+        s1['cwru_train'], s1['cwru_val'], s1['cwru_test'])
+    pader_train, pader_val, pader_test = (
+        s1['pader_train'], s1['pader_val'], s1['pader_test'])
+
+    summary = []
+    for fold in folds:
+        fid = fold['fold']
+        print(f"\n{'─' * 80}\nFOLD {fid}  test={fold['test']}  "
+              f"val={fold['val']}\n{'─' * 80}")
+
+        p_train, p_val, p_test = _build_fold_data(
+            full, per_bearing_weights, fold,
+            noise_sigma=target_noise_sigma,
+            keep_frac=sparsity_keep_frac,
+            input_noise_sigma=input_noise_sigma)
+        train_gen = MultiModalDataGeneratorV3(
+            cwru_train, pader_train, p_train,
+            config.batch_size, shuffle=True, config=config)
+        val_gen = MultiModalDataGeneratorV3(
+            cwru_val, pader_val, p_val,
+            config.batch_size, shuffle=False, config=config)
+        test_gen = MultiModalDataGeneratorV3(
+            cwru_test, pader_test, p_test,
+            config.batch_size, shuffle=False, config=config)
+
+        for arm_name in arms_to_run:
+            cached = _lobocv_load(cache_dir, fid, arm_name)
+            if cached is not None:
+                print(f"  [{arm_name}] cached")
+                summary.append({'fold': fid, 'arm': arm_name, **cached})
+                continue
+
+            print(f"  [{arm_name}] training...")
+            arm_cfg = ConfigV3(**{**config.__dict__, **arms_all[arm_name]})
+            arm_cfg.output_dir = os.path.join(cache_dir, f"fold{fid}_{arm_name}")
+            os.makedirs(arm_cfg.output_dir, exist_ok=True)
+
+            if arm_cfg.use_adaptive_physics:
+                C_use, m_use = C_table.copy(), m_table.copy()
+            else:
+                C_use = np.full_like(C_table, C_median)
+                m_use = np.full_like(m_table, m_median)
+
+            set_reproducible_seed(CURRENT_SEED)
+            model = build_model_v3(arm_cfg, n_sequences)
+            cur = PhysicsCurriculum(
+                lambda_max_mono=arm_cfg.lambda_max_mono,
+                lambda_max_paris=arm_cfg.lambda_max_paris,
+                lambda_max_consist=arm_cfg.lambda_max_consist,
+                k=arm_cfg.curriculum_k, c0=arm_cfg.curriculum_c0)
+            trainer = MultiModalTrainerV3(model, arm_cfg, C_use, m_use, cur)
+            if arm_cfg.cluster_loss_weight > 0:
+                trainer.initialize_cluster_centers(train_gen,
+                                                   num_clusters=arm_cfg.n_clusters)
+
+            model_trained, hist, best_vl = train_single_model_v3(
+                arm_cfg, train_gen, val_gen, trainer, epochs=arm_cfg.epochs)
+
+            mets = evaluate_v3(model_trained, test_gen, C_use, m_use, arm_cfg)
+            record = {'rmse': mets['pronostia_rmse'],
+                      'mae': mets['pronostia_mae'],
+                      'phy_macro': mets['phy_macro'],
+                      'phy_refit_macro': mets['phy_refit_macro'],
+                      'best_val_loss': best_vl,
+                      'epochs_trained': len(hist['loss'])}
+            _lobocv_save(cache_dir, fid, arm_name, record)
+            summary.append({'fold': fid, 'arm': arm_name, **record})
+            print(f"  [{arm_name}] RMSE={record['rmse']:.4f}  "
+                  f"PHY={record['phy_macro']:.4f}")
+
+            import gc; gc.collect()
+            tf.keras.backend.clear_session()
+
+    # ---- aggregate + paired test ----
+    print(f"\n{'=' * 80}\nAGGREGATE — variant={variant}\n{'=' * 80}")
+    agg = {}
+    for arm in arms_to_run:
+        rs = [r['rmse'] for r in summary if r['arm'] == arm]
+        if not rs:
+            continue
+        agg[arm] = {
+            'n_folds': len(rs),
+            'rmse_mean': float(np.mean(rs)),
+            'rmse_std': float(np.std(rs, ddof=1)) if len(rs) > 1 else 0.0,
+            'rmse_per_fold': [float(x) for x in rs],
+        }
+    for arm, a in agg.items():
+        print(f"  {arm:<30} RMSE={a['rmse_mean']:.4f}±{a['rmse_std']:.4f}")
+
+    if 'A0_no_physics' in agg and 'A2_adaptive_physics' in agg:
+        diffs = [a2 - a0 for a2, a0 in zip(
+            agg['A2_adaptive_physics']['rmse_per_fold'],
+            agg['A0_no_physics']['rmse_per_fold'])]
+        n = len(diffs)
+        wins = sum(1 for d in diffs if d < 0)
+        m = float(np.mean(diffs))
+        sd = float(np.std(diffs, ddof=1)) if n > 1 else 0.0
+        se = sd / np.sqrt(n) if n > 0 else 0.0
+        t = m / se if se > 0 else 0.0
+        print(f"\n  [A2 vs A0] per-fold diff (A2 − A0):")
+        for i, d in enumerate(diffs):
+            print(f"    fold {i+1}: {d:+.4f}")
+        print(f"    mean {m:+.4f}  std {sd:.4f}  SE {se:.4f}  t={t:+.2f}  "
+              f"A2 wins {wins}/{n}")
+        if abs(t) >= 2.0:
+            print(f"    → |t|={abs(t):.2f} ≥ 2.0: effect is DETECTABLE at "
+                  f"α=0.05 (two-sided)")
+        else:
+            print(f"    → |t|={abs(t):.2f} < 2.0: cannot distinguish from noise")
+
+    agg_path = os.path.join(cache_dir, 'lobocv_aggregate.json')
+    with open(agg_path, 'w') as f:
+        json.dump({'variant': variant, 'aggregate': agg,
+                   'per_fold': summary}, f, indent=2, default=str)
+    print(f"\n  ✓ saved {agg_path}")
+    return agg
+
+def run_cross_condition(splits=None, arms_to_run=None, epochs_override=40,
+                        target_noise_sigma=None):
+    """
+    Cross-condition LOBOCV: train on one Pronostia condition,
+    validate on a bearing from the target condition, test on the
+    remaining bearings of the target condition.
+
+    Splits (train_condition -> test_condition):
+      'C1_to_C2' : train Bearing1_x,  val=2_1, test=2_2..2_7
+      'C2_to_C1' : train Bearing2_x,  val=1_1, test=1_2..1_7
+      'C1C2_to_C3': train 1_x + 2_x,  val=3_1, test=3_2, 3_3
+
+    Physics prior (Paris) must help under distribution shift if it is
+    to be useful in deployment, where the test condition is unseen.
+    """
+    print(f"\n{'=' * 80}\nCROSS-CONDITION LOBOCV — Seed {CURRENT_SEED}\n{'=' * 80}")
+
+    s1 = load_stage1()
+    config = ConfigV3(**s1['config_dict'])
+    config.random_state = CURRENT_SEED
+    config.output_dir = STAGE_DIR
+    if epochs_override is not None:
+        config.epochs = epochs_override
+
+    cache_dir = os.path.join(STAGE_DIR, 'lobocv_cross_condition')
+    os.makedirs(cache_dir, exist_ok=True)
+    print(f"  cache: {cache_dir}")
+
+    # ---- build the merged 17-bearing pool (same as LOBOCV) ----
+    print("\n[CROSS] Precomputing per-bearing GPR weights...")
+    full, per_bearing_weights = _precompute_bearing_weights(s1, config)
+    X_vib, X_ews, y_rul, bearings, seq_ids, temporal, _ = full
+
+    # ---- define condition groups ----
+    cond_groups = {
+        'C1': [b for b in ALL_BEARINGS if b.startswith('Bearing1_')],
+        'C2': [b for b in ALL_BEARINGS if b.startswith('Bearing2_')],
+        'C3': [b for b in ALL_BEARINGS if b.startswith('Bearing3_')],
+    }
+    print("\n[CROSS] Condition groups:")
+    for c, bs in cond_groups.items():
+        print(f"  {c}: {bs}")
+
+    # ---- define the split list ----
+    all_splits = {
+        'C1_to_C2': {
+            'train': cond_groups['C1'],
+            'val':   ['Bearing2_1'],
+            'test':  [b for b in cond_groups['C2'] if b != 'Bearing2_1'],
+        },
+        'C2_to_C1': {
+            'train': cond_groups['C2'],
+            'val':   ['Bearing1_1'],
+            'test':  [b for b in cond_groups['C1'] if b != 'Bearing1_1'],
+        },
+        'C1C2_to_C3': {
+            'train': cond_groups['C1'] + cond_groups['C2'],
+            'val':   ['Bearing3_1'],
+            'test':  [b for b in cond_groups['C3'] if b != 'Bearing3_1'],
+        },
+    }
+    if splits is None:
+        splits = ['C1_to_C2', 'C2_to_C1', 'C1C2_to_C3']
+
+    arms_all = {
+        'A0_no_physics': dict(
+            use_adaptive_physics=False, use_huber_residual=False,
+            use_physics_curriculum=False, use_uncertainty_weighting=False,
+            alpha_mono=0.0, beta_paris=0.0, gamma_consist=0.0,
+            cluster_loss_weight=0.0),
+        'A2_adaptive_physics': dict(
+            use_adaptive_physics=True, use_huber_residual=False,
+            use_physics_curriculum=True, use_uncertainty_weighting=True),
+    }
+    if arms_to_run is None:
+        arms_to_run = ['A0_no_physics', 'A2_adaptive_physics']
+
+    C_table = s1['C_table']; m_table = s1['m_table']
+    C_median = s1['C_median']; m_median = s1['m_median']
+    n_sequences = len(s1['bearing_to_seq'])
+
+    cwru_train, cwru_val, cwru_test = (
+        s1['cwru_train'], s1['cwru_val'], s1['cwru_test'])
+    pader_train, pader_val, pader_test = (
+        s1['pader_train'], s1['pader_val'], s1['pader_test'])
+
+    summary = []
+    for split_name in splits:
+        spec = all_splits[split_name]
+        print(f"\n{'─' * 80}\nSPLIT {split_name}")
+        print(f"  train={spec['train']}")
+        print(f"  val  ={spec['val']}")
+        print(f"  test ={spec['test']}")
+        print(f"{'─' * 80}")
+
+        p_train, p_val, p_test = _build_fold_data(
+            full, per_bearing_weights, spec,
+            noise_sigma=target_noise_sigma)
+
+        train_gen = MultiModalDataGeneratorV3(
+            cwru_train, pader_train, p_train,
+            config.batch_size, shuffle=True, config=config)
+        val_gen = MultiModalDataGeneratorV3(
+            cwru_val, pader_val, p_val,
+            config.batch_size, shuffle=False, config=config)
+        test_gen = MultiModalDataGeneratorV3(
+            cwru_test, pader_test, p_test,
+            config.batch_size, shuffle=False, config=config)
+
+        for arm_name in arms_to_run:
+            cache_path = os.path.join(cache_dir,
+                                       f"{split_name}_{arm_name}.json")
+            if os.path.exists(cache_path):
+                print(f"  [{arm_name}] cached")
+                with open(cache_path) as f:
+                    cached = json.load(f)
+                summary.append({'split': split_name, 'arm': arm_name,
+                                **cached})
+                continue
+
+            print(f"  [{arm_name}] training...")
+            arm_cfg = ConfigV3(**{**config.__dict__, **arms_all[arm_name]})
+            arm_cfg.output_dir = os.path.join(
+                cache_dir, f"{split_name}_{arm_name}")
+            os.makedirs(arm_cfg.output_dir, exist_ok=True)
+
+            if arm_cfg.use_adaptive_physics:
+                C_use, m_use = C_table.copy(), m_table.copy()
+            else:
+                C_use = np.full_like(C_table, C_median)
+                m_use = np.full_like(m_table, m_median)
+
+            set_reproducible_seed(CURRENT_SEED)
+            model = build_model_v3(arm_cfg, n_sequences)
+            cur = PhysicsCurriculum(
+                lambda_max_mono=arm_cfg.lambda_max_mono,
+                lambda_max_paris=arm_cfg.lambda_max_paris,
+                lambda_max_consist=arm_cfg.lambda_max_consist,
+                k=arm_cfg.curriculum_k, c0=arm_cfg.curriculum_c0)
+            trainer = MultiModalTrainerV3(model, arm_cfg, C_use, m_use, cur)
+            if arm_cfg.cluster_loss_weight > 0:
+                trainer.initialize_cluster_centers(
+                    train_gen, num_clusters=arm_cfg.n_clusters)
+
+            model_trained, hist, best_vl = train_single_model_v3(
+                arm_cfg, train_gen, val_gen, trainer, epochs=arm_cfg.epochs)
+
+            mets = evaluate_v3(model_trained, test_gen, C_use, m_use, arm_cfg)
+            record = {'rmse': mets['pronostia_rmse'],
+                      'mae': mets['pronostia_mae'],
+                      'phy_macro': mets['phy_macro'],
+                      'phy_refit_macro': mets['phy_refit_macro'],
+                      'best_val_loss': best_vl,
+                      'epochs_trained': len(hist['loss'])}
+            with open(cache_path, 'w') as f:
+                json.dump(record, f, indent=2, default=str)
+            summary.append({'split': split_name, 'arm': arm_name, **record})
+            print(f"  [{arm_name}] RMSE={record['rmse']:.4f}")
+
+            import gc; gc.collect()
+            tf.keras.backend.clear_session()
+
+    # ---- paired comparison per split ----
+    print(f"\n{'=' * 80}\nCROSS-CONDITION AGGREGATE\n{'=' * 80}")
+    split_results = {}
+    for split_name in splits:
+        a0 = next((r for r in summary
+                   if r['split'] == split_name and r['arm'] == 'A0_no_physics'),
+                  None)
+        a2 = next((r for r in summary
+                   if r['split'] == split_name and r['arm'] == 'A2_adaptive_physics'),
+                  None)
+        if a0 and a2:
+            diff = a2['rmse'] - a0['rmse']
+            split_results[split_name] = {
+                'A0_rmse': a0['rmse'],
+                'A2_rmse': a2['rmse'],
+                'diff': diff,
+            }
+            print(f"\n  {split_name}: A0={a0['rmse']:.4f}  A2={a2['rmse']:.4f}  "
+                  f"Δ(A2-A0)={diff:+.4f}")
+
+    # ---- across-split summary ----
+    if len(split_results) >= 2:
+        diffs = [v['diff'] for v in split_results.values()]
+        n = len(diffs)
+        mean = float(np.mean(diffs))
+        sd = float(np.std(diffs, ddof=1)) if n > 1 else 0.0
+        se = sd / np.sqrt(n)
+        t = mean / se if se > 0 else 0.0
+        wins = sum(1 for d in diffs if d < 0)
+        print(f"\n  ACROSS SPLITS (A2 - A0): "
+              f"mean={mean:+.4f}  SE={se:.4f}  t={t:+.2f}  "
+              f"A2 wins {wins}/{n}")
+        print(f"  NOTE: only 3 splits → low power. Interpret as "
+              f"qualitative, not statistical.")
+
+    agg_path = os.path.join(cache_dir, 'cross_condition_aggregate.json')
+    with open(agg_path, 'w') as f:
+        json.dump({'splits': split_results, 'per_run': summary},
+                  f, indent=2, default=str)
+    print(f"\n  ✓ saved {agg_path}")
+    return split_results
+# =============================================================
+# STAGE SELECTOR
+# =============================================================
+
+RUN_STAGE = 1 # 1=Data+Gen, 2=Ablation, 3=GPR kernels, 4=UQ,
+               # 5=PHY, 6=Robustness, 7=Figures
+
+if __name__ == "__main__":
+    RUN_LOBOCV = True
+    if RUN_LOBOCV:
+        # Diagnostic 1: kinked-linear target (non-Paris)
+        run_lobocv(
+            folds_to_run=None,
+            arms_to_run=['A0_no_physics', 'A2_adaptive_physics'],
+            epochs_override=40,
+            target_noise_sigma=None,  # second diagnosis   input_noise_sigma=0.20,     # 20% of per-channel std   #forth sparsity_keep_frac=0.10,   # keep only 10% of training windows
+            tag_suffix='kinked',  # 2,3,4 'power'
+        )
+         # add this:
+    elif RUN_STAGE == 'cross':
+        run_cross_condition(
+            splits=['C1_to_C2', 'C2_to_C1', 'C1C2_to_C3'],
+            arms_to_run=['A0_no_physics', 'A2_adaptive_physics'],
+            epochs_override=40,
+        )
+
+    elif RUN_STAGE == 1:
+        run_stage_1()
+    elif RUN_STAGE == 2:
+        run_stage_2()
+    elif RUN_STAGE == 3:
+        run_stage_3()
+    elif RUN_STAGE == 4:
+        run_stage_4()
+    elif RUN_STAGE == 5:
+        run_stage_5()
+    elif RUN_STAGE == 6:
+        run_stage_6()
+    elif RUN_STAGE == 7:
+        run_stage_7()
+    else:
+        raise ValueError(f"Unknown stage {RUN_STAGE}")
